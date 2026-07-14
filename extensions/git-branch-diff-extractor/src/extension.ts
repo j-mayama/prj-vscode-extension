@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 // ─────────────────────────────────────────────
 // Utility: exec git commands
 // ─────────────────────────────────────────────
@@ -32,6 +33,16 @@ function execGitBuffer(args: string[], cwd: string): Promise<Buffer> {
 function getWorkspaceRoot(): string | undefined {
     const folders = vscode.workspace.workspaceFolders;
     return folders && folders.length > 0 ? folders[0].uri.fsPath : undefined;
+}
+function resolveOutputPath(outputRoot: string, gitPath: string): string {
+    const root = path.resolve(outputRoot);
+    const destination = path.resolve(root, gitPath.replace(/\//g, path.sep));
+    const normalizeCase = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+    const rootPrefix = normalizeCase(root.endsWith(path.sep) ? root : root + path.sep);
+    if (!normalizeCase(destination).startsWith(rootPrefix)) {
+        throw new Error(`出力先外を指すパスを拒否しました: ${gitPath}`);
+    }
+    return destination;
 }
 // ─────────────────────────────────────────────
 // Branch Item for TreeView
@@ -406,14 +417,13 @@ async function extractBranchDiff(branchItem: BranchItem, context: vscode.Extensi
             // 2. 作成地点〜先端の「そのブランチでコミットした」ファイルを集約
             //    （first-parent / マージ除外 で、ブランチ自身のコミット分のみを対象）
             progress.report({ message: 'コミット変更ファイル一覧を取得中...' });
-            const logOutput = (await execGit([
+            const logOutput = await execGit([
                 'log', '--first-parent', '--no-merges',
-                '--format=', '--name-only',
+                '-z', '--format=', '--name-only',
                 `${baseCommit}..${branchName}`
-            ], root)).trim();
+            ], root);
             const uniquePaths = Array.from(new Set(logOutput
-                .split('\n')
-                .map(l => l.trim())
+                .split('\0')
                 .filter(l => l.length > 0)));
             const filesToExtract: string[] = [];
             for (const filePath of uniquePaths) {
@@ -443,12 +453,12 @@ async function extractBranchDiff(branchItem: BranchItem, context: vscode.Extensi
                     message: `(${copied + 1}/${total}) ${filePath}`,
                     increment: (1 / total) * 100
                 });
-                const destPath = path.join(outputDir, filePath);
-                const destDir = path.dirname(destPath);
                 try {
+                    const destPath = resolveOutputPath(outputDir, filePath);
+                    const destDir = path.dirname(destPath);
                     fs.mkdirSync(destDir, { recursive: true });
-                    // git cat-file --filters で改行コード等を保持して取得
-                    const fileContent = await execGitBuffer(['cat-file', '--filters', `${branchName}:${filePath}`], root);
+                    // Git blobそのものを取得し、改行コードやバイナリ内容を変換しない
+                    const fileContent = await execGitBuffer(['cat-file', 'blob', `${branchName}:${filePath}`], root);
                     fs.writeFileSync(destPath, fileContent);
                     copied++;
                 }
@@ -490,19 +500,17 @@ async function extractBranchDiff(branchItem: BranchItem, context: vscode.Extensi
 // ─────────────────────────────────────────────
 async function extractDiffToFolder(baseCommit: string, targetRef: string, label: string, root: string, outputDir: string) {
     const diffOutput = (await execGit([
-        'diff', '--name-status', '--no-renames',
+        'diff', '--name-status', '-z', '--no-renames',
         baseCommit, targetRef
-    ], root)).trim();
+    ], root));
     if (!diffOutput) {
         return { copied: 0, total: 0, deleted: 0, errors: [] as string[] };
     }
     const fileStatus = new Map<string, string>();
-    for (const line of diffOutput.split('\n')) {
-        if (!line) {
-            continue;
-        }
-        const [st, ...fp] = line.split('\t');
-        const fpath = fp.join('\t');
+    const fields = diffOutput.split('\0');
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+        const st = fields[index];
+        const fpath = fields[index + 1];
         if (st && fpath) {
             fileStatus.set(fpath, st.charAt(0));
         }
@@ -520,11 +528,11 @@ async function extractDiffToFolder(baseCommit: string, targetRef: string, label:
     let copied = 0;
     const errors: string[] = [];
     for (const filePath of filesToExtract) {
-        const destPath = path.join(outputDir, filePath);
-        const destDir = path.dirname(destPath);
         try {
+            const destPath = resolveOutputPath(outputDir, filePath);
+            const destDir = path.dirname(destPath);
             fs.mkdirSync(destDir, { recursive: true });
-            const fileContent = await execGitBuffer(['cat-file', '--filters', `${targetRef}:${filePath}`], root);
+            const fileContent = await execGitBuffer(['cat-file', 'blob', `${targetRef}:${filePath}`], root);
             fs.writeFileSync(destPath, fileContent);
             copied++;
         }
@@ -532,7 +540,17 @@ async function extractDiffToFolder(baseCommit: string, targetRef: string, label:
             errors.push(`${filePath}: ${err.message}`);
         }
     }
-    return { copied, total: filesToExtract.length, deleted: 0, errors };
+    let deleted = 0;
+    if (deletedFiles.length > 0) {
+        try {
+            fs.writeFileSync(path.join(outputDir, '_DELETED_FILES.txt'), deletedFiles.join('\n') + '\n', 'utf-8');
+            deleted = deletedFiles.length;
+        }
+        catch (err: any) {
+            errors.push(`_DELETED_FILES.txt: ${err.message}`);
+        }
+    }
+    return { copied, total: filesToExtract.length, deleted, errors };
 }
 interface CommitInfo {
     hash: string;
@@ -544,20 +562,24 @@ interface CommitInfo {
     refs: string[];
 }
 async function getCommitGraph(branchName: string, cwd: string): Promise<CommitInfo[]> {
-    const logRaw = (await execGit([
+    const logRaw = await execGit([
         'log',
-        '--format=%H\t%P\t%s\t%ai\t%D',
+        '-z',
+        '--format=%H%x00%P%x00%s%x00%ai%x00%D',
         '--max-count=300',
         branchName
-    ], cwd)).trim();
+    ], cwd);
     if (!logRaw) {
         return [];
     }
-    return logRaw.split('\n').map(line => {
-        const [hash, parentsStr, message, date, refsStr] = line.split('\t');
+    const fields = logRaw.split('\0');
+    if (fields[fields.length - 1] === '') fields.pop();
+    const commits: CommitInfo[] = [];
+    for (let index = 0; index + 4 < fields.length; index += 5) {
+        const [hash, parentsStr, message, date, refsStr] = fields.slice(index, index + 5);
         const parents = parentsStr ? parentsStr.split(' ').filter(p => p) : [];
         const refs = refsStr ? refsStr.split(',').map(r => r.trim()).filter(r => r) : [];
-        return {
+        commits.push({
             hash,
             shortHash: hash.substring(0, 7),
             message,
@@ -565,17 +587,27 @@ async function getCommitGraph(branchName: string, cwd: string): Promise<CommitIn
             parents,
             isMerge: parents.length > 1,
             refs
-        };
-    });
+        });
+    }
+    return commits;
 }
 function buildCommitGraphHtml(commits: CommitInfo[], branchName: string): string {
-    const commitsJson = JSON.stringify(commits);
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const escapeForInlineScript = (value: unknown) => JSON.stringify(value)
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+    const commitsJson = escapeForInlineScript(commits);
+    const branchNameJson = escapeForInlineScript(branchName);
     return /*html*/ `<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+<style nonce="${nonce}">
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
     font-family: var(--vscode-font-family, 'Segoe UI', sans-serif);
@@ -773,10 +805,10 @@ body {
 
 <div class="graph-container" id="graphContainer"></div>
 
-<script>
+<script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const commits = ${commitsJson};
-const branchName = ${JSON.stringify(branchName)};
+const branchName = ${branchNameJson};
 let fromIdx = -1;
 let toIdx = -1;
 
@@ -795,7 +827,7 @@ function formatDate(dateStr) {
 }
 
 function renderGraph() {
-    container.innerHTML = '';
+    container.replaceChildren();
     commits.forEach((c, idx) => {
         const row = document.createElement('div');
         row.className = 'commit-row';
@@ -806,12 +838,31 @@ function renderGraph() {
         graphCol.className = 'graph-col';
         const circleColor = c.isMerge ? '#da70d6' : '#0078d4';
         const nodeSize = c.isMerge ? 7 : 5;
-        graphCol.innerHTML =
-            '<svg width="36" height="30">' +
-            (idx > 0 ? '<line x1="18" y1="0" x2="18" y2="' + (15-nodeSize) + '" stroke="#555" stroke-width="2"/>' : '') +
-            (idx < commits.length-1 ? '<line x1="18" y1="' + (15+nodeSize) + '" x2="18" y2="30" stroke="#555" stroke-width="2"/>' : '') +
-            '<circle cx="18" cy="15" r="' + nodeSize + '" fill="' + circleColor + '" stroke="' + circleColor + '" stroke-width="1.5"/>' +
-            '</svg>';
+        const svgNs = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(svgNs, 'svg');
+        svg.setAttribute('width', '36');
+        svg.setAttribute('height', '30');
+        const appendLine = (y1, y2) => {
+            const line = document.createElementNS(svgNs, 'line');
+            line.setAttribute('x1', '18');
+            line.setAttribute('y1', String(y1));
+            line.setAttribute('x2', '18');
+            line.setAttribute('y2', String(y2));
+            line.setAttribute('stroke', '#555');
+            line.setAttribute('stroke-width', '2');
+            svg.appendChild(line);
+        };
+        if (idx > 0) appendLine(0, 15 - nodeSize);
+        if (idx < commits.length - 1) appendLine(15 + nodeSize, 30);
+        const circle = document.createElementNS(svgNs, 'circle');
+        circle.setAttribute('cx', '18');
+        circle.setAttribute('cy', '15');
+        circle.setAttribute('r', String(nodeSize));
+        circle.setAttribute('fill', circleColor);
+        circle.setAttribute('stroke', circleColor);
+        circle.setAttribute('stroke-width', '1.5');
+        svg.appendChild(circle);
+        graphCol.appendChild(svg);
 
         // Hash
         const hashCol = document.createElement('div');
@@ -822,20 +873,21 @@ function renderGraph() {
         const msgCol = document.createElement('div');
         msgCol.className = 'message-col';
 
-        let refHtml = '';
         for (const r of c.refs) {
-            if (r.startsWith('HEAD')) {
-                refHtml += '<span class="ref-tag ref-head">' + escHtml(r) + '</span>';
-            } else {
-                refHtml += '<span class="ref-tag ref-branch">' + escHtml(r) + '</span>';
-            }
+            const refTag = document.createElement('span');
+            refTag.className = r.startsWith('HEAD') ? 'ref-tag ref-head' : 'ref-tag ref-branch';
+            refTag.textContent = r;
+            msgCol.appendChild(refTag);
         }
 
-        const msgText = c.isMerge && c.message.startsWith('Merge ')
-            ? '<span class="merge-label">' + escHtml(c.message) + '</span>'
-            : escHtml(c.message);
-
-        msgCol.innerHTML = refHtml + msgText;
+        if (c.isMerge && c.message.startsWith('Merge ')) {
+            const mergeLabel = document.createElement('span');
+            mergeLabel.className = 'merge-label';
+            mergeLabel.textContent = c.message;
+            msgCol.appendChild(mergeLabel);
+        } else {
+            msgCol.appendChild(document.createTextNode(c.message));
+        }
 
         // Date
         const dateCol = document.createElement('div');
@@ -851,10 +903,6 @@ function renderGraph() {
         container.appendChild(row);
     });
     updateHighlights();
-}
-
-function escHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function onCommitClick(idx) {
@@ -959,9 +1007,16 @@ async function extractByCommitRange(branchItem: BranchItem, context: vscode.Exte
     // WebView パネルを作成
     const panel = vscode.window.createWebviewPanel('commitGraph', `コミット範囲選択: ${branchName}`, vscode.ViewColumn.One, { enableScripts: true, retainContextWhenHidden: true });
     panel.webview.html = buildCommitGraphHtml(commits, branchName);
+    const commitsByHash = new Map(commits.map(commit => [commit.hash, commit]));
     // WebView からのメッセージを受信
     panel.webview.onDidReceiveMessage(async (msg) => {
-        if (msg.type === 'extract') {
+        if (msg && msg.type === 'extract') {
+            const fromCommit = typeof msg.fromHash === 'string' ? commitsByHash.get(msg.fromHash) : undefined;
+            const toCommit = typeof msg.toHash === 'string' ? commitsByHash.get(msg.toHash) : undefined;
+            if (!fromCommit || !toCommit || fromCommit.hash === toCommit.hash) {
+                vscode.window.showErrorMessage('WebView から無効なコミット範囲を受信しました。');
+                return;
+            }
             panel.dispose();
             // 出力先選択
             const defaultUri = getDefaultOutputUri(context);
@@ -985,12 +1040,12 @@ async function extractByCommitRange(branchItem: BranchItem, context: vscode.Exte
             fs.mkdirSync(outputDir, { recursive: true });
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
-                title: `${msg.fromShort}..${msg.toShort} の差分を抽出中...`,
+                title: `${fromCommit.shortHash}..${toCommit.shortHash} の差分を抽出中...`,
                 cancellable: false
             }, async (progress) => {
                 try {
                     progress.report({ message: '差分ファイルを抽出中...' });
-                    const result = await extractDiffToFolder(msg.fromHash, msg.toHash, `${msg.fromShort}..${msg.toShort}`, root, outputDir);
+                    const result = await extractDiffToFolder(fromCommit.hash, toCommit.hash, `${fromCommit.shortHash}..${toCommit.shortHash}`, root, outputDir);
                     if (result.total === 0 && result.deleted === 0) {
                         vscode.window.showInformationMessage('この範囲には差分ファイルがありません。');
                         return;
@@ -1002,7 +1057,7 @@ async function extractByCommitRange(branchItem: BranchItem, context: vscode.Exte
                         vscode.window.showWarningMessage(`${result.copied}/${result.total} ファイルを抽出しました（${result.errors.length} 件エラー）${delMsg}`, '詳細を見る', 'フォルダを開く').then(async (selection) => {
                             if (selection === '詳細を見る') {
                                 const channel = vscode.window.createOutputChannel('Branch Diff Extractor');
-                                channel.appendLine(`=== エラー詳細 (${msg.fromShort}..${msg.toShort}) ===`);
+                                channel.appendLine(`=== エラー詳細 (${fromCommit.shortHash}..${toCommit.shortHash}) ===`);
                                 result.errors.forEach((e: string) => channel.appendLine(e));
                                 channel.show();
                             }

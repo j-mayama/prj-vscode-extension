@@ -3,14 +3,21 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 
 const HOOKS_DIR = path.join(os.homedir(), '.claude', 'hooks');
 const TTS_INPUT_FILE = path.join(HOOKS_DIR, 'tts_input.json');
 const STATE_FILE = path.join(HOOKS_DIR, 'voice_state.json');
 const CONFIG_FILE = path.join(HOOKS_DIR, 'voice_config.json');
+const RELAY_SCRIPT_FILE = path.join(HOOKS_DIR, 'voicevox_tts_relay.py');
+const RELAY_TOKEN_FILE = path.join(HOOKS_DIR, 'voicevox_relay_token');
+const BUNDLED_RELAY_SCRIPT = path.join(__dirname, 'voicevox_tts_relay.py');
 const VOICEVOX_HOST = '127.0.0.1';
 const VOICEVOX_PORT = 50021;
+const RELAY_PORT = 50022;
+const MAX_RELAY_BODY_BYTES = 64 * 1024;
+const MAX_SPEAK_TEXT_LENGTH = 10_000;
 
 let config = null;
 let lastMsgHash = '';
@@ -18,6 +25,36 @@ let watcher = null;
 let lastTabSwitch = 0;
 let lastFocus = 0;
 let greetingDone = false;
+
+function ensureRelayAssets() {
+    if (!fs.existsSync(BUNDLED_RELAY_SCRIPT)) {
+        throw new Error(`Bundled relay script is missing: ${BUNDLED_RELAY_SCRIPT}`);
+    }
+    const bundled = fs.readFileSync(BUNDLED_RELAY_SCRIPT);
+    if (!fs.existsSync(RELAY_SCRIPT_FILE) || !fs.readFileSync(RELAY_SCRIPT_FILE).equals(bundled)) {
+        fs.writeFileSync(RELAY_SCRIPT_FILE, bundled, { mode: 0o700 });
+    }
+    if (!fs.existsSync(RELAY_TOKEN_FILE)) {
+        fs.writeFileSync(RELAY_TOKEN_FILE, crypto.randomBytes(32).toString('hex'), { encoding: 'utf-8', mode: 0o600 });
+    }
+    const token = fs.readFileSync(RELAY_TOKEN_FILE, 'utf-8').trim();
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+        throw new Error(`Invalid relay token file: ${RELAY_TOKEN_FILE}`);
+    }
+    return token;
+}
+
+function isAuthorizedRelayRequest(req, relayToken) {
+    const supplied = req.headers['x-voicevox-relay-token'];
+    if (typeof supplied !== 'string') return false;
+    const expectedBuffer = Buffer.from(relayToken);
+    const suppliedBuffer = Buffer.from(supplied);
+    return expectedBuffer.length === suppliedBuffer.length && crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function isSafeContainerHome(value) {
+    return /^\/(?:[A-Za-z0-9._-]+\/?)*$/.test(value) && !value.split('/').includes('..');
+}
 
 // --- Config ---
 function loadConfig() {
@@ -140,6 +177,12 @@ function buildPhrases(cfg) {
         'vsc_task_start.wav': { speaker: ns, speed: nspd, text: 'tasuku kaishi!' },
         'vsc_task_end.wav': { speaker: ns, speed: nspd, text: 'tasuku owatta!' },
         'kangaechuu.wav': { speaker: ns, speed: nspd, text: 'kangaechuu' },
+        'break_1.wav': { speaker: ns, speed: nspd, text: 'kyuukei shiyou!' },
+        'break_2.wav': { speaker: ms, speed: mspd, text: `${n}, sukoshi yasumou.` },
+        'break_3.wav': { speaker: ns, speed: nspd, text: 'me to karada wo yasumete ne.' },
+        'latenight_1.wav': { speaker: ms, speed: mspd, text: `${n}, mou osoku dayo.` },
+        'latenight_2.wav': { speaker: ns, speed: nspd, text: 'muri shinai de ne.' },
+        'latenight_3.wav': { speaker: ms, speed: mspd, text: 'soro soro yasumou.' },
 
         // Git
         'git_commit.wav': { speaker: ns, speed: nspd, text: 'komitto shitayo!' },
@@ -204,12 +247,38 @@ function saveState(state) {
 
 // --- Audio playback ---
 function playWav(filename) {
-    const wavPath = path.join(HOOKS_DIR, filename).replace(/\\/g, '/');
-    if (!fs.existsSync(wavPath)) return;
-    execFile('powershell', ['-WindowStyle', 'Hidden', '-c', `(New-Object Media.SoundPlayer '${wavPath}').PlaySync()`], { windowsHide: true });
+    if (typeof filename !== 'string' || !/^[A-Za-z0-9_.-]+\.wav$/i.test(filename)) return false;
+    const hooksRoot = path.resolve(HOOKS_DIR);
+    const wavPath = path.resolve(hooksRoot, filename);
+    if (!wavPath.startsWith(hooksRoot + path.sep) || !fs.existsSync(wavPath) || !fs.statSync(wavPath).isFile()) return false;
+    execFile(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', '(New-Object Media.SoundPlayer $env:VOICEVOX_WAV_PATH).PlaySync()'],
+        { windowsHide: true, env: { ...process.env, VOICEVOX_WAV_PATH: wavPath } }
+    );
+    return true;
 }
 
 function randomPick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function registerInterval(context, callback, delay) {
+    const interval = setInterval(callback, delay);
+    context.subscriptions.push({ dispose: () => clearInterval(interval) });
+}
+
+function registerTimeout(context, callback, delay) {
+    const timeout = setTimeout(callback, delay);
+    context.subscriptions.push({ dispose: () => clearTimeout(timeout) });
+}
 
 function httpPost(reqPath, body, binary = false) {
     return new Promise((resolve, reject) => {
@@ -234,7 +303,11 @@ function httpPost(reqPath, body, binary = false) {
 function saveBinaryAndPlay(buffer) {
     const tmp = path.join(os.tmpdir(), `voicevox_${Date.now()}.wav`);
     fs.writeFileSync(tmp, buffer);
-    execFile('powershell', ['-WindowStyle', 'Hidden', '-c', `(New-Object Media.SoundPlayer '${tmp}').PlaySync(); Remove-Item '${tmp}'`], { windowsHide: true });
+    execFile(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', '(New-Object Media.SoundPlayer $env:VOICEVOX_WAV_PATH).PlaySync(); Remove-Item -LiteralPath $env:VOICEVOX_WAV_PATH'],
+        { windowsHide: true, env: { ...process.env, VOICEVOX_WAV_PATH: tmp } }
+    );
 }
 
 async function speak(text) {
@@ -327,10 +400,9 @@ async function detectDockerProject() {
     }
 }
 
-function execShell(cmd) {
+function execProcess(file, args) {
     return new Promise((resolve, reject) => {
-        const { exec } = require('child_process');
-        exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(file, args, { maxBuffer: 10 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
             if (err) return reject(new Error(stderr || err.message));
             resolve(stdout);
         });
@@ -339,7 +411,7 @@ function execShell(cmd) {
 
 async function findContainerName(serviceName) {
     try {
-        const out = await execShell('docker ps --format "{{.Names}}"');
+        const out = await execProcess('docker', ['ps', '--format', '{{.Names}}']);
         const names = out.split('\n').map(s => s.trim()).filter(s => s);
         // Match patterns: project_service_1, project-service-1
         const match = names.find(n => n.includes(`_${serviceName}_`) || n.includes(`-${serviceName}-`) || n.endsWith(`_${serviceName}`) || n.endsWith(`-${serviceName}`));
@@ -352,9 +424,9 @@ async function findContainerName(serviceName) {
 async function findContainerHomePath(containerName) {
     try {
         // Get default user's home directory
-        const out = await execShell(`docker exec ${containerName} sh -c "echo $HOME"`);
+        const out = await execProcess('docker', ['exec', containerName, 'sh', '-c', 'printf %s "$HOME"']);
         const home = out.trim();
-        if (home) return home;
+        if (isSafeContainerHome(home)) return home;
     } catch (e) {}
     return '/root';
 }
@@ -362,7 +434,7 @@ async function findContainerHomePath(containerName) {
 async function findContainerPython(containerName) {
     for (const cmd of ['python3', 'python']) {
         try {
-            await execShell(`docker exec ${containerName} ${cmd} --version`);
+            await execProcess('docker', ['exec', containerName, cmd, '--version']);
             return cmd;
         } catch (e) {}
     }
@@ -385,56 +457,82 @@ async function autoSetupContainer(containerName) {
         result.steps.push(`Python: ${python}`);
 
         // 3. Create hooks dir
-        await execShell(`docker exec ${containerName} mkdir -p ${home}/.claude/hooks`);
+        const containerHooksDir = `${home}/.claude/hooks`;
+        await execProcess('docker', ['exec', containerName, 'mkdir', '-p', containerHooksDir]);
         result.steps.push(`Created ${home}/.claude/hooks`);
 
-        // 4. Copy relay script
-        const relayPath = path.join(HOOKS_DIR, 'voicevox_tts_relay.py');
-        await execShell(`docker cp "${relayPath}" ${containerName}:${home}/.claude/hooks/voicevox_tts_relay.py`);
-        result.steps.push('Copied voicevox_tts_relay.py');
+        // 4. Copy relay assets unless they are already supplied by the read-only host mount.
+        const containerRelayPath = `${containerHooksDir}/voicevox_tts_relay.py`;
+        const containerTokenPath = `${containerHooksDir}/voicevox_relay_token`;
+        try {
+            await execProcess('docker', ['exec', containerName, 'test', '-r', containerRelayPath]);
+            await execProcess('docker', ['exec', containerName, 'test', '-r', containerTokenPath]);
+            result.steps.push('Relay script and authentication token are already mounted');
+        } catch (e) {
+            await execProcess('docker', ['cp', RELAY_SCRIPT_FILE, `${containerName}:${containerRelayPath}`]);
+            await execProcess('docker', ['cp', RELAY_TOKEN_FILE, `${containerName}:${containerTokenPath}`]);
+            result.steps.push('Copied relay script and authentication token');
+        }
 
         // 5. Fix ownership (in case docker cp made it root-owned)
         try {
-            const userInfo = await execShell(`docker exec ${containerName} sh -c "id -u && id -g"`);
+            const userInfo = await execProcess('docker', ['exec', containerName, 'sh', '-c', 'id -u; id -g']);
             const [uid, gid] = userInfo.trim().split('\n');
-            await execShell(`docker exec -u 0 ${containerName} chown -R ${uid}:${gid} ${home}/.claude/hooks`);
-            result.steps.push(`Fixed ownership to ${uid}:${gid}`);
+            if (/^\d+$/.test(uid) && /^\d+$/.test(gid)) {
+                await execProcess('docker', ['exec', '-u', '0', containerName, 'chown', '-R', `${uid}:${gid}`, containerHooksDir]);
+                result.steps.push(`Fixed ownership to ${uid}:${gid}`);
+            }
         } catch (e) {}
 
         // 6. Add Stop hook to settings.json (merge, don't replace)
-        const settingsPath = `${home}/.claude/settings.json`;
         const mergeScript = `
-import json, os
-p = '${settingsPath}'
+import json, os, sys
+p = os.path.expanduser('~/.claude/settings.json')
 try:
     s = json.load(open(p)) if os.path.exists(p) else {}
 except:
     s = {}
 s.setdefault('hooks', {})
-s['hooks']['Stop'] = [{
+stop_hooks = s['hooks'].setdefault('Stop', [])
+if not isinstance(stop_hooks, list):
+    stop_hooks = [stop_hooks]
+relay_command = ${JSON.stringify(python)} + ' ' + os.path.expanduser('~/.claude/hooks/voicevox_tts_relay.py')
+filtered_hooks = []
+for entry in stop_hooks:
+    if not isinstance(entry, dict):
+        filtered_hooks.append(entry)
+        continue
+    has_relay = any(
+        hook.get('command') == relay_command
+        for hook in entry.get('hooks', []) if isinstance(hook, dict)
+    )
+    if not has_relay:
+        filtered_hooks.append(entry)
+stop_hooks = filtered_hooks
+stop_hooks.append({
     'matcher': '',
     'hooks': [{
         'type': 'command',
-        'command': '${python} ${home}/.claude/hooks/voicevox_tts_relay.py',
+        'command': relay_command,
         'timeout': 10,
         'async': True
     }]
-}]
+})
+s['hooks']['Stop'] = stop_hooks
 os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(s, open(p, 'w'), indent=2, ensure_ascii=False)
 print('OK')
 `;
-        // Write script to a temp file in container then execute
-        const tmpScript = `/tmp/voicevox_setup_${Date.now()}.py`;
+        // Pass the setup script as base64 without invoking a host shell.
         const scriptB64 = Buffer.from(mergeScript).toString('base64');
-        await execShell(`docker exec ${containerName} sh -c "echo '${scriptB64}' | base64 -d > ${tmpScript}"`);
-        await execShell(`docker exec ${containerName} ${python} ${tmpScript}`);
-        await execShell(`docker exec ${containerName} rm -f ${tmpScript}`);
+        const executeSetup = 'import base64,sys;exec(compile(base64.b64decode(sys.argv[1]), "voicevox_setup.py", "exec"))';
+        await execProcess('docker', ['exec', containerName, python, '-c', executeSetup, scriptB64]);
         result.steps.push('Added Stop hook to settings.json');
 
         // 7. Test relay
         try {
-            await execShell(`docker exec ${containerName} ${python} -c "import urllib.request, json; urllib.request.urlopen(urllib.request.Request('http://host.docker.internal:50022/speak', data=json.dumps({'text':'docker setup complete'}).encode(), headers={'Content-Type':'application/json'}, method='POST'), timeout=5)"`);
+            const testCode = "import pathlib,urllib.request,json; token=(pathlib.Path.home()/'.claude/hooks/voicevox_relay_token').read_text().strip(); urllib.request.urlopen(urllib.request.Request('http://host.docker.internal:50022/speak', data=json.dumps({'text':'docker setup complete'}).encode(), headers={'Content-Type':'application/json','X-VOICEVOX-Relay-Token':token}, method='POST'), timeout=5).read()";
+            await execProcess('docker', ['exec', containerName, python, '-c', testCode]);
             result.steps.push('Test relay OK - voice should play now!');
         } catch (e) {
             result.steps.push(`Test relay failed: ${e.message}`);
@@ -513,15 +611,29 @@ async function setupDockerIntegration() {
         serviceName = picked;
     }
 
+    const containerName = await findContainerName(serviceName);
+    let containerHome = '/root';
+    if (containerName) {
+        containerHome = await findContainerHomePath(containerName);
+    } else {
+        const enteredHome = await vscode.window.showInputBox({
+            prompt: 'Container user home directory used by Claude Code',
+            value: '/root',
+            validateInput: value => isSafeContainerHome(value) ? null : 'Use an absolute POSIX path containing only letters, numbers, dot, underscore, dash, and slash.'
+        });
+        if (!enteredHome) return;
+        containerHome = enteredHome === '/' ? '/' : enteredHome.replace(/\/$/, '');
+    }
+
     // Generate docker-compose.override.yml
     const overridePath = path.join(projectRoot, 'docker-compose.override.yml');
-    const hooksHostPath = HOOKS_DIR.replace(/\\/g, '/');
+    const hooksHostPath = HOOKS_DIR.replace(/\\/g, '/').replace(/\$/g, () => '$$');
     const overrideContent = `# Auto-generated by VOICEVOX TTS extension
 # Mounts host's ~/.claude/hooks/ into the container so the relay script is available
 services:
   ${serviceName}:
     volumes:
-      - ${hooksHostPath}:/root/.claude/hooks:ro
+      - "${hooksHostPath.replace(/"/g, '\\"')}:${containerHome === '/' ? '' : containerHome}/.claude/hooks:ro"
     environment:
       - VOICEVOX_RELAY_HOST=host.docker.internal:50022
     extra_hosts:
@@ -539,11 +651,13 @@ services:
 
     if (writeOverride) {
         fs.writeFileSync(overridePath, overrideContent, 'utf-8');
+    } else {
+        vscode.window.showInformationMessage('VOICEVOX: Docker setup canceled; existing override was not changed.');
+        return;
     }
 
     // Try to auto-setup the running container
     let autoSetupResult = null;
-    const containerName = await findContainerName(serviceName);
     if (containerName) {
         const doAuto = await vscode.window.showInformationMessage(
             `VOICEVOX: Container '${containerName}' is running. Auto-setup now?`,
@@ -561,7 +675,7 @@ services:
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "python3 /home/USER/.claude/hooks/voicevox_tts_relay.py",
+        "command": "python3 ~/.claude/hooks/voicevox_tts_relay.py",
         "timeout": 10,
         "async": true
       }]
@@ -572,7 +686,7 @@ services:
     const autoStepsHtml = autoSetupResult
         ? `<div class="step ${autoSetupResult.success ? 'done' : ''}">
   <h2>Auto Setup ${autoSetupResult.success ? 'Complete!' : 'Result'}</h2>
-  <ul>${autoSetupResult.steps.map(s => `<li>${s}</li>`).join('')}</ul>
+  <ul>${autoSetupResult.steps.map(s => `<li>${escapeHtml(s)}</li>`).join('')}</ul>
 </div>`
         : '';
 
@@ -584,7 +698,9 @@ services:
     );
     panel.webview.html = `
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><style>
+<html><head><meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<style>
 body { font-family: sans-serif; padding: 20px; line-height: 1.6; }
 code { background: #2a2a2a; padding: 2px 6px; border-radius: 3px; }
 pre { background: #1a1a1a; padding: 12px; border-radius: 6px; overflow-x: auto; }
@@ -596,17 +712,17 @@ h2 { color: #4a9eff; }
 ${autoStepsHtml}
 <div class="step done">
   <h2>docker-compose.override.yml created</h2>
-  <p>Path: <code>${overridePath.replace(/\\/g, '/')}</code></p>
+  <p>Path: <code>${escapeHtml(overridePath.replace(/\\/g, '/'))}</code></p>
   <p>This mounts your host's hooks directory into the container (for future restarts).</p>
 </div>
 <div class="step">
   <h2>Step 2: Container Settings (Manual)</h2>
   <p>Add this hook to your container's <code>~/.claude/settings.json</code>:</p>
-  <pre>${settingsSnippet}</pre>
+  <pre>${escapeHtml(settingsSnippet)}</pre>
   <p><strong>How to do it:</strong></p>
   <ol>
     <li>Restart your container: <code>docker-compose down && docker-compose up -d</code></li>
-    <li>Enter the container: <code>docker-compose exec ${serviceName} bash</code></li>
+    <li>Enter the container: <code>docker-compose exec ${escapeHtml(serviceName)} bash</code></li>
     <li>Edit settings.json: <code>nano ~/.claude/settings.json</code></li>
     <li>Add the hook above (merge with existing hooks if present)</li>
   </ol>
@@ -616,6 +732,7 @@ ${autoStepsHtml}
   <p>From inside the container, test the relay:</p>
   <pre>curl -X POST http://host.docker.internal:50022/speak \\
   -H "Content-Type: application/json" \\
+  -H "X-VOICEVOX-Relay-Token: $(cat ~/.claude/hooks/voicevox_relay_token)" \\
   -d '{"text":"Hello from Docker"}'</pre>
   <p>You should hear Tsumugi from your host PC speakers!</p>
 </div>
@@ -624,7 +741,7 @@ ${autoStepsHtml}
   <ul>
     <li>VOICEVOX must be running on the host PC (port 50021)</li>
     <li>VSCode with this extension must be running on the host (relay server on port 50022)</li>
-    <li>The script <code>voicevox_tts_relay.py</code> is auto-mounted from host</li>
+    <li>The relay script and authentication token are auto-mounted from host</li>
   </ul>
 </div>
 </body></html>
@@ -641,6 +758,7 @@ async function activate(context) {
     // Ensure hooks dir exists
     if (!fs.existsSync(HOOKS_DIR)) fs.mkdirSync(HOOKS_DIR, { recursive: true });
     if (!fs.existsSync(TTS_INPUT_FILE)) fs.writeFileSync(TTS_INPUT_FILE, '{"last_assistant_message": ""}', 'utf-8');
+    const relayToken = ensureRelayAssets();
 
     // Load or run setup wizard
     config = loadConfig();
@@ -676,7 +794,7 @@ async function activate(context) {
     );
 
     // Auto-detect Docker project on activation
-    setTimeout(() => detectDockerProject(), 3000);
+    registerTimeout(context, () => detectDockerProject(), 3000);
 
     const state = loadState();
     state.sessionStart = Date.now();
@@ -688,7 +806,7 @@ async function activate(context) {
     // tts_input.json watcher
     watcher = fs.watch(TTS_INPUT_FILE, (eventType) => { if (eventType === 'change' || eventType === 'rename') onFileChanged(); });
     let lastMtime = 0;
-    setInterval(() => { try { const s = fs.statSync(TTS_INPUT_FILE); if (s.mtimeMs !== lastMtime) { lastMtime = s.mtimeMs; onFileChanged(); } } catch(e) {} }, 100);
+    registerInterval(context, () => { try { const s = fs.statSync(TTS_INPUT_FILE); if (s.mtimeMs !== lastMtime) { lastMtime = s.mtimeMs; onFileChanged(); } } catch(e) {} }, 100);
 
     // VSCode events
     context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(() => { playWav('vsc_saved.wav'); checkMemoryTriggers(loadState()); }));
@@ -707,14 +825,14 @@ async function activate(context) {
     setupGitWatcher(context);
 
     // Break reminder (every 60 minutes)
-    setInterval(() => {
+    registerInterval(context, () => {
         const breakWavs = ['break_1.wav', 'break_2.wav', 'break_3.wav'];
         playWav(randomPick(breakWavs));
         vscode.window.showInformationMessage('VOICEVOX: Break time! Stretch and rest your eyes.');
     }, 60 * 60 * 1000);
 
     // Late night check (every 30 minutes after 23:00)
-    setInterval(() => {
+    registerInterval(context, () => {
         const h = new Date().getHours();
         if (h >= 23 || h < 5) {
             const lateWavs = ['latenight_1.wav', 'latenight_2.wav', 'latenight_3.wav'];
@@ -722,94 +840,53 @@ async function activate(context) {
         }
     }, 30 * 60 * 1000);
 
-    // HTTP relay server for Docker containers / external clients
-    // POST http://host.docker.internal:50022/speak  body: {"text": "..."}
-    const RELAY_PORT = 50022;
+    // Authenticated HTTP relay server for Docker containers.
     const relayServer = http.createServer((req, res) => {
-        const url = req.url || '/';
+        const requestPath = new URL(req.url || '/', 'http://localhost').pathname;
 
-        // GET endpoints (setup script & files)
-        if (req.method === 'GET') {
-            try {
-                if (url === '/setup') {
-                    // Return a bash setup script that includes files inline (base64)
-                    const relayPath = path.join(HOOKS_DIR, 'voicevox_tts_relay.py');
-                    const claudeMdPath = path.join(os.homedir(), '.claude', 'CLAUDE.md');
-                    const relayB64 = fs.existsSync(relayPath) ? fs.readFileSync(relayPath).toString('base64') : '';
-                    const claudeMdB64 = fs.existsSync(claudeMdPath) ? fs.readFileSync(claudeMdPath).toString('base64') : '';
-                    const script = `#!/bin/bash
-# VOICEVOX Container Setup (auto-generated)
-set -e
-HOOKS_DIR="$HOME/.claude/hooks"
-mkdir -p "$HOOKS_DIR"
-
-# Write relay script
-echo '${relayB64}' | base64 -d > "$HOOKS_DIR/voicevox_tts_relay.py"
-chmod +x "$HOOKS_DIR/voicevox_tts_relay.py"
-
-# Write CLAUDE.md
-echo '${claudeMdB64}' | base64 -d > "$HOME/.claude/CLAUDE.md"
-
-# Merge Stop hook into settings.json
-PYTHON=$(command -v python3 || command -v python || echo python3)
-$PYTHON - <<'PYEOF'
-import json, os
-p = os.path.expanduser('~/.claude/settings.json')
-try:
-    s = json.load(open(p)) if os.path.exists(p) else {}
-except:
-    s = {}
-s.setdefault('hooks', {})
-s['hooks']['Stop'] = [{
-    'matcher': '',
-    'hooks': [{
-        'type': 'command',
-        'command': 'python3 ' + os.path.expanduser('~/.claude/hooks/voicevox_tts_relay.py'),
-        'timeout': 10,
-        'async': True
-    }]
-}]
-os.makedirs(os.path.dirname(p), exist_ok=True)
-json.dump(s, open(p, 'w'), indent=2, ensure_ascii=False)
-print('settings.json updated')
-PYEOF
-
-echo "VOICEVOX setup complete!"
-`;
-                    res.writeHead(200, { 'Content-Type': 'text/plain' });
-                    res.end(script);
-                    return;
-                }
-                if (url === '/health') {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ ok: true, version: '2.0.0' }));
-                    return;
-                }
-                res.writeHead(404); res.end('Not Found');
-                return;
-            } catch (e) {
-                res.writeHead(500); res.end('Error: ' + e.message);
-                return;
-            }
+        if (req.method === 'GET' && requestPath === '/health') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok: true, version: '2.2.1' }));
+            return;
         }
 
         if (req.method !== 'POST') {
             res.writeHead(405); res.end('Method Not Allowed'); return;
         }
+        if (!isAuthorizedRelayRequest(req, relayToken)) {
+            res.writeHead(401, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+            return;
+        }
+        const declaredLength = Number(req.headers['content-length'] || 0);
+        if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > MAX_RELAY_BODY_BYTES) {
+            res.writeHead(413); res.end('Payload Too Large'); return;
+        }
         let body = '';
-        req.on('data', chunk => body += chunk);
+        let bodyBytes = 0;
+        let rejected = false;
+        req.on('data', chunk => {
+            bodyBytes += chunk.length;
+            if (bodyBytes > MAX_RELAY_BODY_BYTES) {
+                rejected = true;
+                res.writeHead(413); res.end('Payload Too Large');
+                req.destroy();
+                return;
+            }
+            body += chunk;
+        });
         req.on('end', () => {
+            if (rejected) return;
             try {
                 const data = JSON.parse(body);
-                if (url === '/speak' && data.text) {
+                if (requestPath === '/speak' && typeof data.text === 'string' && data.text.length > 0 && data.text.length <= MAX_SPEAK_TEXT_LENGTH) {
                     speak(data.text);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true }));
-                } else if (url === '/play' && data.wav) {
-                    playWav(data.wav);
+                } else if (requestPath === '/play' && typeof data.wav === 'string' && playWav(data.wav)) {
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true }));
-                } else if (url === '/notify' && data.message) {
+                } else if (requestPath === '/notify' && typeof data.message === 'string' && data.message.length <= MAX_SPEAK_TEXT_LENGTH) {
                     // Extract last meaningful line
                     let t = data.message;
                     t = t.replace(/```[\s\S]*?```/g, '')
@@ -846,7 +923,7 @@ echo "VOICEVOX setup complete!"
             }
         });
     });
-    // Listen on 0.0.0.0 so Docker containers can reach it via host.docker.internal
+    // Docker reaches this listener via host.docker.internal; every mutating endpoint requires a random local token.
     relayServer.listen(RELAY_PORT, '0.0.0.0', () => {
         outputChannel.appendLine(`HTTP relay server listening on port ${RELAY_PORT}`);
     });

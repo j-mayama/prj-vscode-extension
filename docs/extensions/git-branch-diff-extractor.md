@@ -8,13 +8,14 @@
 
 ## フェーズ1：事前調査の結論
 
-- **既存の自作拡張（インストール済み v1.1.0）の復元のため対象外。**
+- インストール済み v1.1.0 を基にソースを復元し、その後 v1.1.1 で公開向けの安全性・配布性を修正した。
 - 復元の経緯：
   - ソースプロジェクトが失われていたため、インストール済み拡張の `out/extension.js`
     （tsc のコンパイル出力。ミニファイなし・コメント保持）から `src/extension.ts` を復元した。
   - tsc の emit は識別子・コメント・文の構造をほぼそのまま保持するため、主な作業は型注釈の復元。
   - 検証：復元した `src/extension.ts` を `tsc -p ./`（TypeScript 5.9.3）で再コンパイルし、
-    生成された `out/extension.js` がインストール済みの `out/extension.js` と**バイト一致**することを確認済み。
+    生成された `out/extension.js` が当時のインストール済みファイルとバイト一致することを確認した。
+    現在の v1.1.1 はセキュリティ修正を含むため、復元元とのバイト一致を目的にしていない。
   - 推定したコンパイル設定：`target: ES2020` / `module: commonjs` / `strict: true` /
     `esModuleInterop: true` / `sourceMap: true` / `outDir: out` / `rootDir: src`
     （`?.` の保持・クラスフィールドのコンストラクタ内代入・`__importStar` ヘルパーの形などから逆算）。
@@ -46,7 +47,7 @@
 - 状態保存：`ExtensionContext.globalState`（Memento、前回出力先の記憶）
 - リソース管理：`context.subscriptions.push(...)` で dispose 登録
 - Node.js 側：`child_process.execFile` で `git` を直接実行
-  （`branch` / `rev-parse` / `merge-base` / `reflog` / `log` / `diff --name-status` / `cat-file --filters` / `rev-list`）、
+  （`branch` / `rev-parse` / `merge-base` / `reflog` / `log` / `diff --name-status -z` / `cat-file blob` / `rev-list`）、
   `fs` / `path` でファイル出力
 
 ## ベストプラクティス（調査結果）
@@ -58,30 +59,27 @@
   - contribution からの遅延アクティベーション（`activationEvents` 空）に準拠済み
   - 長時間処理は `withProgress` + キャンセル対応、エラーは `showErrorMessage` でユーザーに提示済み
 - 避けるべきこと（アンチパターン）：
-  - Webview の `innerHTML` へ外部データを直挿ししない → コミットメッセージ等は `escHtml()` でエスケープ済み
+  - コミットメッセージ等は `textContent` / `createTextNode` で構築し、`innerHTML` に渡さない
+  - インラインデータの `<` 等をUnicodeエスケープし、Webviewはランダムnonce付きCSPで制限する
 - パフォーマンス / アクティベーションの注意：
   - `git log` は `--max-count` で件数制限、`execFile` の `maxBuffer` を拡大して大きめのリポジトリに対応
 
 ## セキュリティ上の注意（この拡張固有）
 
 - 扱うシークレット / 認証情報：なし（git コマンドのローカル実行のみ）
-- Webview の有無と CSP 方針：Webview あり（コミット範囲選択）。**現状 CSP / nonce 未設定でインラインスクリプトを使用**
-  → 復元元の実装のまま。改修時に CSP + nonce 化するのが望ましい（下記 TODO）
+- Webview の有無と CSP 方針：Webview あり（コミット範囲選択）。ランダムnonce付きCSPを設定し、
+  Git由来データの `</script>` 脱出を防ぐUnicodeエスケープと、受信コミットハッシュの照合を行う
 - 外部送信するデータ：なし（テレメトリなし、ネットワークアクセスなし）
 
 ## 実装メモ
 
 - 主要ファイル：
-  - `extensions/git-branch-diff-extractor/src/extension.ts`（全ロジック。約 1050 行）
-  - `extensions/git-branch-diff-extractor/tsconfig.json`（emit をバイト一致させるため設定変更に注意）
+  - `extensions/git-branch-diff-extractor/src/extension.ts`（全ロジック）
+  - `extensions/git-branch-diff-extractor/tsconfig.json`
 - ロジックの要点：ブランチの「分岐元（作成地点）」推定を
   ①統合先ブランチのマージ履歴 → ②reflog の最古エントリ → ③親ブランチ（develop/main/master）との merge-base →
   ④ルートコミット、の優先順位で行う（詳細はソース内コメント参照）
 - 未解決の課題 / TODO：
-  - `package.json` の `repository.url` が空（公開リポジトリ確定後に設定する）
   - テストが無い（`@vscode/test-cli` + `@vscode/test-electron` の導入を検討）
-  - Webview に CSP / nonce が無い（`enableScripts: true` のまま。改修時に対応する）
-  - `vscode:prepublish` が `echo skip prepublish` になっており、パッケージ時に自動コンパイルされない
-    （publish 前に手動で `npm run compile` が必要）
   - `catch (err: any)` が多用されている（`unknown` + 型ガードへの置き換え候補）
   - 旧配布物には未使用のバックアップ画像が混入していた（復元プロジェクトでは除外済み）

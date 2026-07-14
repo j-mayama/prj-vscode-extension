@@ -1,7 +1,10 @@
-# .vsix に含めないファイル（extension.js / package.json / README.md だけ梱包されれば十分）
+# extension.js / voicevox_tts_relay.py / package.json / README.md を梱包する
 .vscodeignore
 .gitignore
+package-lock.json
 **/*.vsix
 **/node_modules/**
 **/.vscode/**
+**/__pycache__/**
+**/*.pyc
 docs/**

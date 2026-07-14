@@ -2,13 +2,13 @@
 	"name": "git-branch-diff-extractor",
 	"displayName": "Git Branch Diff Extractor",
 	"description": "サイドバーからGitブランチを選択し、ブランチの差分ファイルを抽出・出力するVSCode拡張機能",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"publisher": "rondomark",
 	"icon": "icon.png",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": ""
+		"url": "https://github.com/j-mayama/prj-vscode-extension.git"
 	},
 	"engines": {
 		"vscode": "^1.80.0"
@@ -64,7 +64,7 @@
 				"gitBranchDiffExtractor.rememberLastOutputDir": {
 					"type": "boolean",
 					"default": true,
-					"description": "前回の出力先フォルダを記憶して次回のダイアログで初期表示する"
+					"description": "前回の出力先フォルダを記憶し、次回の出力先として利用する"
 				}
 			}
 		},
@@ -91,9 +91,10 @@
 		}
 	},
 	"scripts": {
-		"vscode:prepublish": "echo skip prepublish",
+		"vscode:prepublish": "npm run compile",
 		"compile": "tsc -p ./",
-		"watch": "tsc -watch -p ./"
+		"watch": "tsc -watch -p ./",
+		"package": "vsce package --no-dependencies"
 	},
 	"devDependencies": {
 		"@types/node": "^18.0.0",
