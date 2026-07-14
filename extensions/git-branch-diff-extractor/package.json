@@ -1,0 +1,104 @@
+{
+	"name": "git-branch-diff-extractor",
+	"displayName": "Git Branch Diff Extractor",
+	"description": "サイドバーからGitブランチを選択し、ブランチの差分ファイルを抽出・出力するVSCode拡張機能",
+	"version": "1.1.0",
+	"publisher": "rondomark",
+	"icon": "icon.png",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": ""
+	},
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"SCM Providers",
+		"Other"
+	],
+	"activationEvents": [],
+	"main": "./out/extension.js",
+	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "gitBranchDiffExtractor",
+					"title": "Branch Diff Extractor",
+					"icon": "resources/cat.svg"
+				}
+			]
+		},
+		"views": {
+			"gitBranchDiffExtractor": [
+				{
+					"id": "branchList",
+					"name": "ブランチ一覧"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "gitBranchDiffExtractor.refresh",
+				"title": "ブランチ一覧を更新",
+				"icon": "$(refresh)"
+			},
+			{
+				"command": "gitBranchDiffExtractor.extractDiff",
+				"title": "差分を抽出"
+			},
+			{
+				"command": "gitBranchDiffExtractor.extractByCommitRange",
+				"title": "コミット範囲を指定して抽出",
+				"icon": "$(git-commit)"
+			}
+		],
+		"configuration": {
+			"title": "Branch Diff Extractor",
+			"properties": {
+				"gitBranchDiffExtractor.defaultOutputDir": {
+					"type": "string",
+					"default": "",
+					"description": "差分ファイルのデフォルト出力先フォルダ（空欄の場合はデスクトップ）"
+				},
+				"gitBranchDiffExtractor.rememberLastOutputDir": {
+					"type": "boolean",
+					"default": true,
+					"description": "前回の出力先フォルダを記憶して次回のダイアログで初期表示する"
+				}
+			}
+		},
+		"menus": {
+			"view/title": [
+				{
+					"command": "gitBranchDiffExtractor.refresh",
+					"when": "view == branchList",
+					"group": "navigation"
+				}
+			],
+			"view/item/context": [
+				{
+					"command": "gitBranchDiffExtractor.extractDiff",
+					"when": "view == branchList",
+					"group": "inline"
+				},
+				{
+					"command": "gitBranchDiffExtractor.extractByCommitRange",
+					"when": "view == branchList && viewItem == branch",
+					"group": "1_extract"
+				}
+			]
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "echo skip prepublish",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./"
+	},
+	"devDependencies": {
+		"@types/node": "^18.0.0",
+		"@types/vscode": "^1.80.0",
+		"@vscode/vsce": "^3.7.1",
+		"typescript": "^5.3.0"
+	}
+}

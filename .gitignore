@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+*.vsix
+
+# Secrets / credentials（平文コミット禁止）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secrets.toml
+
+# Editor（個人設定・トークン混入防止）
+.vscode/settings.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.nyc_output/
+coverage/
+.vscode-test/

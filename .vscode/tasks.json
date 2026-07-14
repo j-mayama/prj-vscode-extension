@@ -1,0 +1,14 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "compile: git-branch-diff-extractor",
+            "type": "shell",
+            "command": "npm run compile",
+            "options": {
+                "cwd": "${workspaceFolder}/extensions/git-branch-diff-extractor"
+            },
+            "problemMatcher": "$tsc"
+        }
+    ]
+}

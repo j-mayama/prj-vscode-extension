@@ -1,0 +1,7 @@
+# .vsix に含めないファイル（extension.js / package.json / README.md だけ梱包されれば十分）
+.vscodeignore
+.gitignore
+**/*.vsix
+**/node_modules/**
+**/.vscode/**
+docs/**

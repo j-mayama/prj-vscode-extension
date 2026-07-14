@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Branch Diff Extractor",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--extensionDevelopmentPath=${workspaceFolder}/extensions/git-branch-diff-extractor"
+            ],
+            "outFiles": [
+                "${workspaceFolder}/extensions/git-branch-diff-extractor/out/**/*.js"
+            ],
+            "preLaunchTask": "compile: git-branch-diff-extractor"
+        },
+        {
+            "name": "Run VOICEVOX TTS",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": [
+                "--extensionDevelopmentPath=${workspaceFolder}/extensions/voicevox-tts"
+            ]
+        }
+    ]
+}
