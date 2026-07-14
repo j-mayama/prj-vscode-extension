@@ -1,0 +1,14 @@
+# @see https://docs.docker.com/reference/dockerfile/
+
+# @see https://hub.docker.com/_/node
+FROM node:24.11.0
+WORKDIR /workspace
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    vim \
+    git \
+    curl \
+    openssl \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*

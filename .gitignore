@@ -5,6 +5,8 @@ node_modules/
 dist/
 out/
 *.vsix
+__pycache__/
+*.py[cod]
 
 # Secrets / credentials（平文コミット禁止）
 .env
@@ -16,8 +18,13 @@ out/
 
 # Editor（個人設定・トークン混入防止）
 .vscode/settings.json
+.claude/settings.local.json
 .idea/
 *.swp
+
+# 非公開の内部資料（public リポジトリに出さない）
+# 手元では参照したいが、第三者には意味を持たない・公開すべきでない文書を置く
+.claude/skills/**/docs/notion-source.md
 
 # OS
 .DS_Store

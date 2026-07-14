@@ -1,0 +1,26 @@
+# @see https://docs.docker.com/reference/compose-file/services/
+# @see https://docs.docker.com/reference/compose-file/volumes/
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    command: sh -c "chown -R node:node /workspace && exec su -s /bin/sh node -c 'tail -f /dev/null'"
+    volumes:
+      - ..:/workspace
+      - ${HOME:-${USERPROFILE}}/.ssh:/home/node/.ssh:ro
+      - node_modules:/workspace/node_modules
+      - home_node:/home/node # Codex/Claude Code/Cursor のセッション・認証(~/.codex, ~/.claude, ~/.claude.json, ~/.cursor 等)をコンテナ再作成後も保持
+    user: root
+    ports:
+      - 127.0.0.1:3443:3443
+      - 127.0.0.1:4321:4321
+      - 127.0.0.1:5173:5173
+      - 127.0.0.1:6006:6006
+      - 127.0.0.1:8787:8787
+    init: true
+
+volumes:
+  node_modules:
+  home_node:

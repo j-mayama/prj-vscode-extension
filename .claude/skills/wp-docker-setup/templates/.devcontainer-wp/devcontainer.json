@@ -1,0 +1,77 @@
+// @see https://containers.dev/implementors/spec/
+
+{
+  "name": "wp-template", // プロジェクトによって、nameを変えてください
+  "dockerComposeFile": ["docker-compose.yml"],
+  "service": "node",
+  "runServices": [
+    "sql",
+    "php",
+    "httpd",
+    "nginx",
+    "adminer",
+    "phpmyadmin",
+    "mailpit"
+  ],
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=${HOME:-${USERPROFILE}}/.ssh,target=/home/node/.ssh,type=bind,consistency=cached",
+    "source=${HOME:-${USERPROFILE}}/.claude/CLAUDE.md,target=/tmp/host-claude/CLAUDE.md,type=bind,readonly"
+  ],
+  "containerEnv": {
+    "CHOKIDAR_USEPOLLING": "1",
+    "WATCHPACK_POLLING": "true",
+    "FIGMA_ACCESS_TOKEN": "${localEnv:FIGMA_ACCESS_TOKEN}",
+    "FIGMA_API_KEY": "${localEnv:FIGMA_API_KEY}"
+  },
+  "initializeCommand": {
+    "windows": "powershell -ExecutionPolicy Bypass -File .devcontainer/scripts/pre-rebuild-cleanup.ps1 -WorkspaceFolder \"${localWorkspaceFolder}\"",
+    "linux": "bash .devcontainer/scripts/pre-rebuild-cleanup.sh \"${localWorkspaceFolder}\"",
+    "macos": "bash .devcontainer/scripts/pre-rebuild-cleanup.sh \"${localWorkspaceFolder}\""
+  },
+  "remoteUser": "node",
+  "postCreateCommand": "mkdir -p ~/.npm-global && npm config set prefix '~/.npm-global' && export PATH=~/.npm-global/bin:$PATH && npm install -g @anthropic-ai/claude-code browser-sync && grep -qxF \"export PATH=~/.npm-global/bin:$PATH\" ~/.bashrc || echo \"export PATH=~/.npm-global/bin:$PATH\" >> ~/.bashrc",
+  "postStartCommand": "mkdir -p ~/.claude && if [ -f /tmp/host-claude/CLAUDE.md ]; then cp /tmp/host-claude/CLAUDE.md ~/.claude/CLAUDE.md; fi && bash .devcontainer/scripts/start-browser-sync.sh",
+  "postAttachCommand": "bash .devcontainer/scripts/start-browser-sync.sh",
+  "remoteEnv": {
+    "PATH": "/home/node/.npm-global/bin:${containerEnv:PATH}"
+  },
+  "forwardPorts": [3000, 3001],
+  "shutdownAction": "stopCompose",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "sanderronde.phpstan-vscode",
+        "dbaeumer.vscode-eslint",
+        "stylelint.vscode-stylelint",
+        "esbenp.prettier-vscode",
+        "yoavbls.pretty-ts-errors",
+        "astro-build.astro-vscode",
+        "formulahendry.auto-rename-tag",
+        "shardulm94.trailing-spaces",
+        "mosapride.zenkaku",
+        "oderwat.indent-rainbow",
+        "gruntfuggly.todo-tree",
+        "ms-playwright.playwright",
+        "anthropic.claude-code",
+        "mhutchie.git-graph",
+        "eamodio.gitlens",
+        "donjayamanne.githistory",
+        "echoapi.echoapi-for-vscode",
+        "ryu1kn.partial-diff"
+      ],
+      "settings": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true,
+        "stylelint.validate": ["css", "scss", "astro", "html"],
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "always",
+          "source.fixAll.stylelint": "always"
+        },
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "files.trimFinalNewlines": true
+      }
+    }
+  }
+}

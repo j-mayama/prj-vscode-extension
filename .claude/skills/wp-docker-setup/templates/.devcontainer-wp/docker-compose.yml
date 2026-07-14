@@ -1,0 +1,136 @@
+# @see https://docs.docker.com/reference/compose-file/services/
+# @see https://docs.docker.com/reference/compose-file/volumes/
+
+x-copy-wp: &copy-wp >
+  sh -c "sh /var/www/html/.devcontainer/scripts/init-wp-config.sh &&
+  exec php-fpm"
+x-wp-content: &wp_content ../wordpress/wp-content:/var/www/html/wordpress/wp-content
+services:
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command: sh -c "sh /workspace/.devcontainer/scripts/init-certs.sh && chown -R node:node /workspace && exec su -s /bin/sh node -c 'tail -f /dev/null'"
+    ports:
+      - 127.0.0.1:3000:3000
+      - 127.0.0.1:3001:3001
+    volumes:
+      - ..:/workspace
+      - ${HOME:-${USERPROFILE}}/.ssh:/home/node/.ssh:ro
+      - node_modules:/workspace/node_modules
+      - home_node:/home/node # Codex/Claude Code/Cursor のセッション・認証(~/.codex, ~/.claude, ~/.claude.json, ~/.cursor 等)をコンテナ再作成後も保持
+    user: root
+    init: true
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -s /workspace/.devcontainer/certs/localhost.crt -a -s /workspace/.devcontainer/certs/localhost.key",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  sql:
+    image: mysql:9.6.0 # @see https://hub.docker.com/_/mysql
+    ports:
+      - 127.0.0.1:3306:3306
+    command: [--max_allowed_packet=256M]
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: database
+      MYSQL_USER: user
+      MYSQL_PASSWORD: p@ssw0rd
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -prootpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - sql_data:/var/lib/mysql
+
+  php:
+    build:
+      context: .
+      dockerfile: Dockerfile.php
+    environment:
+      WORDPRESS_DB_NAME: database # wp-config.phpのDB_NAMEに書く値
+      WORDPRESS_DB_USER: user # wp-config.phpのDB_USERに書く値
+      WORDPRESS_DB_PASSWORD: p@ssw0rd # wp-config.phpのDB_PASSWORDに書く値
+      WORDPRESS_DB_HOST: sql # wp-config.phpのDB_HOSTに書く値
+      WORDPRESS_TABLE_PREFIX: wp_ # wp-config.phpの$table_prefixに書く値（本番が独自接頭子なら合わせる）
+      MAILPIT_HOST: mailpit
+      MAILPIT_PORT: 1025
+    command: *copy-wp
+    volumes:
+      - ..:/var/www/html
+      - *wp_content
+      - ./php/uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+    depends_on:
+      - sql
+
+  httpd:
+    image: httpd:2.4.66 # @see https://hub.docker.com/_/httpd
+    volumes:
+      - ..:/var/www/html
+      - *wp_content
+      - ./httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+    depends_on:
+      - php
+
+  nginx:
+    image: nginx:1.29.5 # @see https://hub.docker.com/_/nginx
+    ports:
+      - 127.0.0.1:8080:443
+    depends_on:
+      php:
+        condition: service_started
+      node:
+        condition: service_healthy
+    volumes:
+      - ..:/var/www/html
+      - *wp_content
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+  mailpit:
+    image: axllent/mailpit:latest # @see https://hub.docker.com/r/axllent/mailpit
+    ports:
+      - 127.0.0.1:8081:8025
+      - 127.0.0.1:1025:1025
+    volumes:
+      - mailpit_data:/data
+    environment:
+      TZ: Asia/Tokyo
+      MP_MAX_MESSAGE: 5000
+      MP_DATABASE: /data/mailpit.db
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest # @see https://hub.docker.com/_/phpmyadmin
+    depends_on:
+      sql:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:8084:80
+    environment:
+      PMA_HOST: sql
+      PMA_PORT: 3306
+      MEMORY_LIMIT: 256M
+      UPLOAD_LIMIT: 256M
+      MYSQL_ROOT_PASSWORD: rootpass
+
+  adminer:
+    image: adminer:latest # @see https://hub.docker.com/_/adminer/
+    depends_on:
+      - sql
+    ports:
+      - 127.0.0.1:8083:8080
+
+volumes:
+  node_modules:
+  home_node:
+  sql_data:
+  mailpit_data:
