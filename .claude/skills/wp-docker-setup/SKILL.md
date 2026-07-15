@@ -1,7 +1,7 @@
 ---
 name: wp-docker-setup
 description: WordPress のローカル開発環境（.devcontainer）を半自動でセットアップするスキル。発動キーワード「Dockerセットアップ」。phpinfo()のコピペ、WPルートのパス、プロジェクト名等を対話で確定し、`.claude/skills/wp-docker-setup/templates/.devcontainer-wp/`または`.devcontainer-wp/`（Nodeも同様）をベースに変数置換した`.devcontainer/`を生成する。最後に、自動化できない手動ステップのチェックリストを出す。
-version: "1.7.0"
+version: "1.8.0"
 ---
 
 # wp-docker-setup
@@ -22,6 +22,10 @@ version: "1.7.0"
 - 「Dockerセットアップ」
 - 「ローカル環境を構築」「ローカル環境構築」（明確に Docker / devcontainer 文脈の場合）
 - 「.devcontainer を作成」「devcontainer 設定」
+
+**このスキルは新規構築の担当。** 既に `.devcontainer/` がある案件に、古いバージョンで作った
+環境へ後付けの機能を入れたい場合は `wp-docker-update` スキル（`/wp-docker-update`）を使う。
+このスキルで `--force` すると利用者の手編集ごと吹き飛ぶ。
 
 ## 前提
 
@@ -134,8 +138,9 @@ python .claude/skills/wp-docker-setup/scripts/install_devcontainer.py \
 1. `<project-root>/.claude/skills/wp-docker-setup/templates/.devcontainer-wp/` または `.devcontainer-node/` を優先して読み込み（なければ `<project-root>/.devcontainer-wp/` または `.devcontainer-node/`）
 2. 変数置換を適用（`name`、`wp-root`パス、PHPバージョン、WPバージョン、MySQLバージョン等）
 3. `<project-root>/<output>/` に書き出し
-4. `<project-root>/<wp_root>/wp-config.php` が無ければ仮想環境のDB情報と接頭子を記述して生成する。既存なら内容を保持して警告だけ返す
-5. 生成時に `.sh` ファイルを LF 改行で保存し、`<project-root>/.gitattributes` に `*.sh text eol=lf` を自動追加（既存なら追記のみ）
+4. `<project-root>/<output>/.wp-docker-setup.json`（マニフェスト）に、スキルのバージョン・生成パラメータ・**生成した各ファイルの sha256** を記録する
+5. `<project-root>/<wp_root>/wp-config.php` が無ければ仮想環境のDB情報と接頭子を記述して生成する。既存なら内容を保持して警告だけ返す
+6. 生成時に `.sh` ファイルを LF 改行で保存し、`<project-root>/.gitattributes` に `*.sh text eol=lf` を自動追加（既存なら追記のみ）
 
 生成される `devcontainer.json` には `initializeCommand` を含め、リビルド前に host 側で現在のワークスペースに属する古い Compose コンテナとネットワークを自動削除する。
 `devcontainer` と `<workspace-folder>_devcontainer` の2系統を候補にするが、`com.docker.compose.project.working_dir` が現在の `<workspace>/.devcontainer` と一致するリソースだけを削除する。
@@ -277,6 +282,24 @@ python .claude/skills/wp-docker-setup/scripts/install_devcontainer.py \
 
 ## アーキテクチャ（設計判断の記録）
 
+### マニフェスト（`.devcontainer/.wp-docker-setup.json`）
+
+生成時に、スキルのバージョン・生成パラメータ・**生成した各ファイルの sha256** を記録する。
+
+これは `wp-docker-update` スキル（`/wp-docker-update`）が「テンプレが新しくなっただけの
+ファイル」と「利用者が手で直したファイル」を区別するための基準点。sha256 が記録値と一致すれば
+利用者は触っていないと確定でき、安全に更新できる。一致しなければ手編集とみなして触らない。
+
+再実行で内容が変わらないよう、**生成時刻のような非決定な値は入れない**（冪等性を保つため）。
+
+記録する `params` は**引数そのものではなく、生成物から読み戻した実効値**（`resolve_effective_params()`）。
+`--php-version` 等を省略するとテンプレ既定値が使われるが、それを `null` のまま記録すると
+「指定なし＝最新に追従してよい」と誤読され、次回の更新で PHP や MySQL が無警告で上がってしまう。
+その案件は生成時点のバージョンで動いているので、実効値を残して pin する。
+
+テンプレ展開の中身は `render_template_files()` が返す `relpath -> bytes` の写像として定義され、
+`install()` と `wp-docker-update` の両方がこれを呼ぶ。生成内容の定義を二重に持たないため。
+
 ### wp-config.php の責務分担
 
 wp-config.php の値管理は**2層**に分かれている。混同するとDB値が消えたり上書きされたりするので必ず守ること。
@@ -353,6 +376,7 @@ docker-compose.yml の php.command:
 
 | バージョン | 日付       | 変更内容                                                                                                                         |
 | ---------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| 1.8.0      | 2026-07-15 | 生成時にマニフェスト `.devcontainer/.wp-docker-setup.json`（バージョン・生成パラメータ・各ファイルの sha256）を記録。バージョンは引数ではなく生成物から読み戻した実効値を記録し、次回更新で PHP / MySQL が無警告で上がるのを防ぐ。テンプレ展開を副作用のない `render_template_files()` に切り出し、既存環境の更新スキル `wp-docker-update` から再利用できるようにした。`_ensure_shell_lf_gitattributes()` を公開 API `ensure_shell_lf_gitattributes()` に改名 |
 | 1.7.0      | 2026-07-14 | 既存 wp-config.php の無断上書き、既存テーマの自動削除、他ワークスペースの Compose リソース削除を防止。公開ポートを localhost に限定し、非標準の既定パス・Gulp 固有例を一般化。カスタム wp-content のマウント、BrowserSync の URL 案内、テンプレート整合性を修正 |
 | 1.6.0      | 2026-07-14 | 公開リポジトリ向けに汎用化。外部の手順書に依存した記述（丸数字のステップ参照・行番号指定）を、内容ベースの記述に書き直し。例示のプロジェクト名・テーブル接頭子をプレースホルダに置換。参考リンクを公式ドキュメントに差し替え |
 | 1.3.0      | 2026-05-25 | CRLF 起因クラッシュ事例として `pre-rebuild-cleanup.sh` を明示し、DevContainer 起動失敗の診断導線を強化                           |
