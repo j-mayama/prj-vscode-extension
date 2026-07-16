@@ -22,6 +22,9 @@ __pycache__/
 .idea/
 *.swp
 
+# codex-review の自動レビュー ON/OFF スイッチ（各自が手元で切り替える）
+.codex-review-auto
+
 # 非公開の内部資料（public リポジトリに出さない）
 # 手元では参照したいが、第三者には意味を持たない・公開すべきでない文書を置く
 .claude/skills/**/docs/notion-source.md
