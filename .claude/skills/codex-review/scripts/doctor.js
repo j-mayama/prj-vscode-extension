@@ -24,7 +24,10 @@ const { existsSync } = require('node:fs');
 const { homedir } = require('node:os');
 const { join } = require('node:path');
 
-const { resolveCodex, CONFIG_PATH } = require('./run-review.js');
+const { resolveCodex } = require('./run-review.js');
+const { CONFIG_PATH, readConfig } = require('./config-core.js');
+const { validate } = require('./config.js');
+const { hookCommand } = require('./setup-auto.js');
 
 const FIX = process.argv.includes('--fix');
 
@@ -133,8 +136,149 @@ function checkAuth(codex) {
 }
 
 function checkConfig() {
-  if (existsSync(CONFIG_PATH)) ok('設定', CONFIG_PATH);
-  else warn('設定', '未作成', 'スキルの初回セットアップで対話的に作成されます（問題ありません）');
+  if (!existsSync(CONFIG_PATH)) {
+    warn('設定', '未作成', 'setup-auto.js が Codex 本体設定の継承で作成します');
+    return;
+  }
+  try {
+    validate(readConfig({ strict: true }));
+    ok('設定', CONFIG_PATH);
+  } catch (error) {
+    ng(
+      '設定',
+      `${CONFIG_PATH} が不正です: ${error.message}`,
+      'JSON自体が壊れている場合は config.js --reset でバックアップ後に初期化してください'
+    );
+  }
+}
+
+function checkHooks() {
+  const git = run('git', ['rev-parse', '--show-toplevel']);
+  const root = git.status === 0 ? git.stdout.trim() : process.cwd();
+  const localSettings = join(root, '.claude', 'settings.local.json');
+  const candidates = [
+    localSettings,
+    join(root, '.claude', 'settings.json'),
+    join(homedir(), '.claude', 'settings.json'),
+  ];
+  // `matcher: null` means the event must be registered without a matcher —
+  // UserPromptSubmit and Stop do not support one, and Claude Code silently
+  // ignores it there. PreToolUse must carry exactly the tool list the guard
+  // covers, or it would either miss writes or fire on every tool call.
+  const required = {
+    UserPromptSubmit: { script: 'mark-prompt.js', matcher: null },
+    PreToolUse: { script: 'worktree-guard.js', matcher: 'Edit|Write|NotebookEdit' },
+    Stop: { script: 'stop-hook.js', matcher: null },
+  };
+  let expectedCommands;
+  try {
+    expectedCommands = Object.fromEntries(
+      Object.entries(required).map(([eventName, { script }]) => [
+        eventName,
+        hookCommand(join(__dirname, script)),
+      ])
+    );
+  } catch (error) {
+    ng(
+      'hooks',
+      `hookコマンドを生成できません: ${error.message}`,
+      'スキルをWindows shellで展開されないパスへ移してから setup-auto.js を実行してください'
+    );
+    return;
+  }
+  const found = Object.fromEntries(Object.keys(required).map((eventName) => [eventName, []]));
+  const conflicts = [];
+  const armed = existsSync(join(root, '.codex-review-auto'));
+
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const settings = JSON.parse(require('node:fs').readFileSync(path, 'utf8').replace(/^\uFEFF/, ''));
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+        throw new Error('ルートは JSON オブジェクトである必要があります');
+      }
+      const hooks = settings.hooks ?? {};
+      if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) {
+        throw new Error('hooks は JSON オブジェクトである必要があります');
+      }
+      for (const [eventName, groups] of Object.entries(hooks)) {
+        if (!Array.isArray(groups)) throw new Error(`hooks.${eventName} は配列である必要があります`);
+        for (const group of groups) {
+          if (
+            !group ||
+            typeof group !== 'object' ||
+            Array.isArray(group) ||
+            !Array.isArray(group.hooks)
+          ) {
+            throw new Error(`hooks.${eventName} に不正な要素があります`);
+          }
+          for (const handler of group.hooks) {
+            if (!handler || typeof handler !== 'object') continue;
+            const values = [
+              typeof handler.command === 'string' ? handler.command : '',
+              ...(Array.isArray(handler.args) ? handler.args.map(String) : []),
+            ].map((value) => value.replace(/\\/g, '/'));
+            for (const [requiredEvent, { script, matcher }] of Object.entries(required)) {
+              if (!values.some((value) => value.includes(`/codex-review/scripts/${script}`))) continue;
+              const matcherIsExpected =
+                matcher === null
+                  ? !Object.prototype.hasOwnProperty.call(group, 'matcher')
+                  : group.matcher === matcher;
+              const isExpected =
+                path === localSettings &&
+                eventName === requiredEvent &&
+                matcherIsExpected &&
+                handler.type === 'command' &&
+                handler.command === expectedCommands[requiredEvent] &&
+                handler.args === undefined &&
+                (handler.async === undefined || handler.async === false) &&
+                Number.isFinite(handler.timeout) &&
+                handler.timeout >= 30;
+              if (isExpected) found[requiredEvent].push(path);
+              else conflicts.push(`${path}: ${eventName} -> ${script}`);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      const detail = `${path} を読めません: ${error.message}`;
+      const hint = 'JSON 構文を修正してから setup-auto.js を再実行してください';
+      if (armed) ng('hooks', detail, hint);
+      else warn('hooks', detail, hint);
+      return;
+    }
+  }
+
+  for (const [eventName, locations] of Object.entries(found)) {
+    if (locations.length > 1) conflicts.push(`${eventName} が ${locations.length} 件重複`);
+  }
+  if (conflicts.length) {
+    const detail = `競合または旧登録を検出: ${conflicts.join(' / ')}`;
+    const hint =
+      '旧方式のhookを移行する場合は setup-auto.js --migrate-legacy-hooks を実行してください';
+    if (armed) ng('hooks', detail, hint);
+    else warn('hooks', detail, hint);
+    return;
+  }
+
+  const missing = Object.entries(required)
+    .filter(([eventName]) => found[eventName].length === 0)
+    .map(([, { script }]) => script);
+  if (missing.length === 0) {
+    ok('hooks', 'UserPromptSubmit / PreToolUse / Stop を確認');
+  } else if (armed) {
+    ng(
+      'hooks',
+      `${missing.join(' / ')} が未登録`,
+      'node .claude/skills/codex-review/scripts/setup-auto.js を対象リポジトリで再実行してください'
+    );
+  } else {
+    warn(
+      'hooks',
+      `${missing.join(' / ')} が未登録`,
+      'node .claude/skills/codex-review/scripts/setup-auto.js を対象リポジトリで実行してください'
+    );
+  }
 }
 
 function checkGit() {
@@ -151,6 +295,7 @@ function main() {
   const codex = checkCodex(npm);
   checkAuth(codex);
   checkConfig();
+  checkHooks();
   checkGit();
 
   for (const r of results) {

@@ -16,8 +16,8 @@
 | スキル本体 | 無い | mount するかコピーする |
 | codex CLI | 無い | `npm i -g @openai/codex`（`doctor.js --fix` が実行できる） |
 | **認証** (`~/.codex/auth.json`) | 無い | **自動化できない**（後述） |
-| 設定 (`codex-review.config.json`) | 無い | スキルの初回セットアップが対話的に作る |
-| Stop hook (`settings.json`) | 無い | 自動ループを使うなら手で登録する |
+| 設定 (`codex-review.config.json`) | 無い | `setup-auto.js`がCodex本体設定の継承で作る |
+| 自動レビューhook | 無い | 対象リポジトリで`setup-auto.js`を実行する |
 
 まず `node scripts/doctor.js` を実行すれば、この表のどれが欠けているかが分かる。
 

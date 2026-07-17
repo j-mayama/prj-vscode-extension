@@ -27,16 +27,11 @@
  */
 
 const { spawnSync } = require('node:child_process');
-const { existsSync, readFileSync, readdirSync, statSync } = require('node:fs');
+const { existsSync, readdirSync, statSync } = require('node:fs');
 const { homedir } = require('node:os');
 const { delimiter, join } = require('node:path');
 
-const CONFIG_PATH = join(homedir(), '.claude', 'codex-review.config.json');
-
-const DEFAULTS = {
-  timeout_minutes: 15,
-  retry: { max_attempts: 3, wait_seconds: [60, 300, 900] },
-};
+const { CONFIG_PATH, readConfig } = require('./config-core.js');
 
 /**
  * Signatures of a run that died on rate limiting rather than on a real problem.
@@ -57,18 +52,6 @@ const log = (msg) => process.stderr.write(`${msg}\n`);
 
 function sleepSync(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
-}
-
-function readConfig() {
-  let raw = {};
-  try {
-    raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
-  } catch {
-    // No config yet: the skill's setup step writes it. Model flags are simply
-    // omitted, which falls back to whatever ~/.codex/config.toml says.
-  }
-  const retry = { ...DEFAULTS.retry, ...(raw.retry ?? {}) };
-  return { ...DEFAULTS, ...raw, retry };
 }
 
 /**
@@ -200,6 +183,19 @@ function checkRef(scope) {
     : `ブランチ '${value}' が見つかりません`;
 }
 
+function buildReviewArgs(config, scope, outFile) {
+  const args = ['exec', 'review', ...(scope ?? ['--uncommitted'])];
+  if (config.mode !== 'inherit' && config.model) args.push('-m', config.model);
+  if (config.mode !== 'inherit' && config.effort) {
+    args.push('-c', `model_reasoning_effort="${config.effort}"`);
+  }
+  // Reviews read; they never write. The default is workspace-write, so this is
+  // not optional.
+  args.push('-c', 'sandbox_mode="read-only"');
+  args.push('-o', outFile);
+  return args;
+}
+
 function main() {
   const { scope, outFile } = parseArgs(process.argv.slice(2));
   if (!outFile) {
@@ -226,18 +222,17 @@ function main() {
   }
 
   const config = readConfig();
-  const args = ['exec', 'review', ...(scope ?? ['--uncommitted'])];
-  if (config.mode !== 'inherit' && config.model) {
-    args.push('-m', config.model);
-    if (config.effort) args.push('-c', `model_reasoning_effort="${config.effort}"`);
-  }
-  // Reviews read; they never write. The default is workspace-write, so this is
-  // not optional.
-  args.push('-c', 'sandbox_mode="read-only"');
-  args.push('-o', outFile);
+  const args = buildReviewArgs(config, scope, outFile);
 
-  const attempts = Math.max(1, config.retry.max_attempts);
-  const waits = config.retry.wait_seconds ?? [];
+  const attempts = Number.isInteger(config.retry?.max_attempts)
+    ? Math.max(1, config.retry.max_attempts)
+    : 3;
+  const waits = Array.isArray(config.retry?.wait_seconds)
+    ? config.retry.wait_seconds.filter((v) => Number.isInteger(v) && v >= 0)
+    : [60, 300, 900];
+  const timeoutMinutes = Number.isInteger(config.timeout_minutes) && config.timeout_minutes > 0
+    ? config.timeout_minutes
+    : 15;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     log(`codex-review: レビュー実行 (${attempt}/${attempts})`);
@@ -246,7 +241,7 @@ function main() {
       // No shell: args carry a branch name and an output path, and a shell would
       // re-parse both.
       shell: false,
-      timeout: config.timeout_minutes * 60 * 1000,
+      timeout: timeoutMinutes * 60 * 1000,
       maxBuffer: 256 * 1024 * 1024,
     });
 
@@ -258,7 +253,7 @@ function main() {
     }
 
     if (run.error?.code === 'ETIMEDOUT' || run.signal) {
-      log(`codex-review: ${config.timeout_minutes} 分で打ち切りました。`);
+      log(`codex-review: ${timeoutMinutes} 分で打ち切りました。`);
       // A timeout is not a rate limit; retrying the same slow review usually just
       // burns the same time again.
       process.stdout.write('NG: タイムアウトしました。timeout_minutes を延ばすか effort を下げてください\n');
@@ -285,6 +280,6 @@ function main() {
 }
 
 // doctor.js reuses the resolver. Two copies of "where is codex" would drift.
-module.exports = { resolveCodex, readConfig, CONFIG_PATH };
+module.exports = { buildReviewArgs, resolveCodex, readConfig, CONFIG_PATH };
 
 if (require.main === module) process.exit(main());
