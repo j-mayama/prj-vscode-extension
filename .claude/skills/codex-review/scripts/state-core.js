@@ -13,20 +13,18 @@ const { createHash, randomUUID } = require('node:crypto');
 const {
   chmodSync,
   existsSync,
-  linkSync,
   mkdirSync,
   readFileSync,
   readdirSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } = require('node:fs');
 const { homedir } = require('node:os');
 const { join } = require('node:path');
 const { renameAtomic } = require('./file-core.js');
+const { withLock } = require('./lock-core.js');
 
 const STATE_DIR = join(homedir(), '.claude', 'codex-review-state');
-const STALE_LOCK_MS = 5 * 60 * 1000;
 
 function ensureStateDir() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -79,142 +77,9 @@ function writeState(root, state) {
   }
 }
 
-function sameFile(left, right) {
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
-function lockOwner(path) {
-  try {
-    const value = JSON.parse(readFileSync(path, 'utf8'));
-    if (
-      value?.owner !== 'codex-review-state' ||
-      value?.version !== 1 ||
-      !Number.isInteger(value.pid) ||
-      value.pid <= 0 ||
-      typeof value.token !== 'string' ||
-      !value.token.startsWith(`${value.pid}-`) ||
-      typeof value.at !== 'string' ||
-      Number.isNaN(Date.parse(value.at))
-    ) {
-      return null;
-    }
-    return value;
-  } catch {
-    return null;
-  }
-}
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code !== 'ESRCH';
-  }
-}
-
-function finishLockCleanup(lock, cleanupLock) {
-  let claim;
-  try {
-    claim = statSync(cleanupLock);
-  } catch (error) {
-    if (error.code === 'ENOENT') return;
-    throw error;
-  }
-  const owner = lockOwner(cleanupLock);
-  if (!owner) {
-    throw new Error(`所有を確認できないcleanup lockを保持して中止します: ${cleanupLock}`);
-  }
-
-  try {
-    const current = statSync(lock);
-    if (
-      sameFile(claim, current) &&
-      Date.now() - claim.mtimeMs > STALE_LOCK_MS &&
-      !processIsAlive(owner.pid)
-    ) {
-      unlinkSync(lock);
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-
-  try {
-    unlinkSync(cleanupLock);
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-}
-
-function releaseLock(lock, token) {
-  try {
-    const current = JSON.parse(readFileSync(lock, 'utf8'));
-    if (current.token === token) unlinkSync(lock);
-  } catch {
-    // A stale-lock cleanup may already have removed or replaced it.
-  }
-}
-
 function withStateLock(root, action) {
   ensureStateDir();
-  const lock = `${statePath(root)}.lock`;
-  const cleanupLock = `${lock}.cleanup`;
-  const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  let acquired = false;
-
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (existsSync(cleanupLock)) {
-      finishLockCleanup(lock, cleanupLock);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-      continue;
-    }
-    try {
-      writeFileSync(
-        lock,
-        `${JSON.stringify({
-          owner: 'codex-review-state',
-          version: 1,
-          token,
-          pid: process.pid,
-          at: new Date().toISOString(),
-        })}\n`,
-        { flag: 'wx', mode: 0o600 }
-      );
-      acquired = true;
-      if (existsSync(cleanupLock)) {
-        releaseLock(lock, token);
-        acquired = false;
-        finishLockCleanup(lock, cleanupLock);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-        continue;
-      }
-      break;
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > STALE_LOCK_MS) {
-          try {
-            linkSync(lock, cleanupLock);
-          } catch (cleanupError) {
-            if (!['EEXIST', 'ENOENT'].includes(cleanupError.code)) throw cleanupError;
-          }
-          finishLockCleanup(lock, cleanupLock);
-          continue;
-        }
-      } catch (statError) {
-        if (statError.code === 'ENOENT') continue;
-        throw statError;
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-    }
-  }
-
-  if (!acquired) throw new Error('レビュー状態の更新ロックを10秒以内に取得できませんでした');
-  try {
-    return action();
-  } finally {
-    releaseLock(lock, token);
-  }
+  return withLock(`${statePath(root)}.lock`, action, { label: 'レビュー状態の更新ロック' });
 }
 
 function clearClaimsUnlocked(root) {

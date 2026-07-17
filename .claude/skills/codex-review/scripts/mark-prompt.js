@@ -44,18 +44,57 @@ const {
 const {
   OPT_OUT_FILE,
   dirtyEntries,
+  git,
   isEnabled,
   isLinkedWorktree,
   isOptedOut,
   mainRoot,
+  readMergeTargets,
   registeredWorktree,
   toPosix,
   worktreeName,
   worktreePath,
+  writeMergeTarget,
 } = require('./worktree-core.js');
 
 function stateKey(value) {
   return createHash('sha256').update(value).digest('hex').slice(0, 16);
+}
+
+/** The single recorded target for this worktree, or null when there is no usable one. */
+function recordedTarget(shared, name) {
+  const values = readMergeTargets(shared, name);
+  return values.length === 1 ? values[0] : null;
+}
+
+/**
+ * The branch this session's work has to come back to: recorded the first time,
+ * only read afterwards.
+ *
+ * The write happens exactly once — while the worktree does not exist yet, which
+ * is the only moment the shared checkout is guaranteed to be on the branch the
+ * worktree is about to be cut from.
+ *
+ * Once it exists, this must never write again, and that is not a micro-
+ * optimisation. A *resumed* session runs this hook from the shared checkout, not
+ * from its worktree — that is precisely why worktreeContext() has an
+ * `EnterWorktree(path:)` branch at all. So "the session is isolated" cannot be
+ * inferred from the cwd, and re-recording here would quietly retarget the
+ * worktree onto wherever the checkout drifted to since. Worse, it would move the
+ * record and the current branch together, so merge-reviewed.js's comparison
+ * would agree and merge reviewed work into an unrelated branch reporting
+ * success. The existence of the worktree is the durable fact; the cwd is not.
+ */
+function mergeTarget(shared, sessionId, existing) {
+  const name = worktreeName(sessionId);
+  if (existing) return recordedTarget(shared, name);
+
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], shared).trim();
+  // Detached: there is no branch for reviewed work to return to. Recording the
+  // bare sha would name a target no merge can update.
+  if (branch === 'HEAD') return null;
+  writeMergeTarget(shared, name, branch);
+  return branch;
 }
 
 /**
@@ -93,6 +132,25 @@ function worktreeContext(startDir, sessionId) {
     ? `  EnterWorktree(path: "${toPosix(existing.path)}")   ← このセッションの既存worktree`
     : `  EnterWorktree(name: "${worktreeName(sessionId)}")`;
 
+  let target = null;
+  try {
+    target = mergeTarget(shared, sessionId, existing);
+  } catch {
+    // Best effort, deliberately. This hook runs on every prompt and must not
+    // cost the user a turn. merge-reviewed.js refuses to merge without a record
+    // and prints how to restore it, so the failure surfaces where it can be
+    // acted on rather than being guessed at.
+    //
+    // Read back rather than reporting "not recorded": an earlier prompt may have
+    // recorded successfully, and merge would then use that. Saying no merge will
+    // happen when one will is the kind of wrong that gets believed.
+    try {
+      target = recordedTarget(shared, worktreeName(sessionId));
+    } catch {
+      // Nothing readable either — the notice below states that honestly.
+    }
+  }
+
   return [
     '[codex-review] このリポジトリは、実装を伴うセッションを専用ブランチ＋worktreeへ分離します。',
     '同じプロジェクトで並行する別セッションとファイルを奪い合わないための構成です。',
@@ -103,7 +161,11 @@ function worktreeContext(startDir, sessionId) {
     '- 調査・質問だけで終わる場合はworktreeを作らなくて構いません',
     '- 移動せずに共有作業ツリーへ書き込もうとすると、PreToolUseフックが拒否します',
     '- 移動後はレビュー・自動コミットもそのworktree内で通常どおり動作します',
-    '- push / merge / worktreeの削除は行いません。完了報告にブランチとコミットを残してください',
+    target
+      ? `- レビューと自動コミットのあと、${target}（このworktreeの統合先として記録済み）へmergeします`
+        + '（pushとworktreeの削除は行いません）'
+      : '- 統合先を記録できなかったため、レビュー後のmergeは行われません'
+        + '（共有チェックアウトがdetached HEADの場合など。pushとworktreeの削除も行いません）',
   ].join('\n');
 }
 

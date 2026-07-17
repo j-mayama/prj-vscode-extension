@@ -38,6 +38,10 @@ const WORKTREE_RELATIVE = '.claude/worktrees';
 // fails open — reviews stop running and look clean while doing it.
 const IGNORE_LINE = `${WORKTREE_RELATIVE}/`;
 const NAME_PREFIX = 'codex-';
+const NAME_PATTERN = new RegExp(`^${NAME_PREFIX}[0-9a-f]{16}$`);
+// Section for this skill's own repository-config records. Reads and writes go
+// through the shared `.git/config`, which every worktree of the repository sees.
+const CONFIG_SECTION = 'codexreview';
 
 function git(args, cwd) {
   return execFileSync('git', args, {
@@ -63,6 +67,10 @@ function sessionSlug(sessionId) {
 /** `codex-<16 hex>`: 22 chars, within EnterWorktree's 64-char / [A-Za-z0-9._-] rule. */
 function worktreeName(sessionId) {
   return `${NAME_PREFIX}${sessionSlug(sessionId)}`;
+}
+
+function isWorktreeName(value) {
+  return typeof value === 'string' && NAME_PATTERN.test(value);
 }
 
 function toPosix(path) {
@@ -130,6 +138,87 @@ function worktreePath(main, sessionId) {
   return join(main, ...WORKTREE_RELATIVE.split('/'), worktreeName(sessionId));
 }
 
+/**
+ * The inverse of worktreePath(): the session worktree name a checkout sits at,
+ * or null when the path is not one of this skill's worktrees.
+ *
+ * Kept next to worktreePath so the two cannot drift. It exists because the merge
+ * runs from inside the worktree with no session id to hand — the path is the
+ * only identity available there, and it has to resolve to the same name the hook
+ * derived from the session id.
+ */
+function worktreeNameFromPath(main, worktreeRoot) {
+  const parent = join(resolve(main), ...WORKTREE_RELATIVE.split('/'));
+  const rel = relative(parent, resolve(worktreeRoot));
+  if (!rel || rel.includes(sep) || isAbsolute(rel)) return null;
+  return isWorktreeName(rel) ? rel : null;
+}
+
+/**
+ * The repository's common git directory: the same absolute path from every
+ * worktree, and therefore the one identity all sessions of a repository agree
+ * on. Anything that must be exclusive *across* worktrees — as opposed to within
+ * one — has to be keyed on this rather than on a working-tree root.
+ */
+function commonGitDir(cwd) {
+  return resolve(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd).trim());
+}
+
+/**
+ * Rejects anything git would not accept as a branch name.
+ *
+ * Guards both ends of the record: an invalid name is never written, and a
+ * hand-edited or corrupted config can never reach a git argument. Deliberately
+ * `check-ref-format <fullref>` rather than `--branch <name>`, because `--branch`
+ * *expands* the `@{-1}` "previous branch" syntax instead of validating it, and a
+ * validator that resolves its input is not a validator.
+ */
+function isBranchName(cwd, value) {
+  if (typeof value !== 'string' || value === '' || value.startsWith('-')) return false;
+  try {
+    git(['check-ref-format', `refs/heads/${value}`], cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where a worktree records the branch its work must go back to.
+ *
+ * Keyed by worktree name, not branch name: Claude Code names the branch when it
+ * creates the worktree, so that name is not knowable at the moment the target
+ * must be captured — whereas the worktree name is derived from the session id
+ * and is. Stored in the repository config, which is shared by every worktree, so
+ * a resumed session reads back exactly what the original one wrote.
+ */
+function mergeTargetKey(name) {
+  if (!isWorktreeName(name)) throw new Error(`worktree名が不正です: ${name}`);
+  return `${CONFIG_SECTION}.${name}.mergeInto`;
+}
+
+/**
+ * Every value recorded for this worktree. Returns a list rather than a string
+ * because a multi-valued key means the record is corrupt, and the caller must be
+ * able to refuse rather than silently pick one.
+ */
+function readMergeTargets(main, name) {
+  try {
+    return git(['config', '--local', '--get-all', mergeTargetKey(name)], main)
+      .split(/\r?\n/)
+      .filter((line) => line !== '');
+  } catch (error) {
+    // Exit 1 is git's "no such key", which is simply "never recorded".
+    if (error.status === 1) return [];
+    throw error;
+  }
+}
+
+function writeMergeTarget(main, name, branch) {
+  if (!isBranchName(main, branch)) throw new Error(`ブランチ名が不正です: ${branch}`);
+  git(['config', '--local', '--replace-all', mergeTargetKey(name), branch], main);
+}
+
 /** The session's worktree, but only when git still knows about it. */
 function registeredWorktree(cwd, main, sessionId) {
   const expected = worktreePath(main, sessionId);
@@ -146,9 +235,15 @@ function registeredWorktree(cwd, main, sessionId) {
  * changes stay behind in the shared tree and the session silently works against
  * HEAD instead. Migrating them is explicitly out of scope (stash/reset/copy all
  * risk the user's work), so the honest move is to stop and say so.
+ *
+ * `untracked: false` narrows this to tracked changes, for callers that only care
+ * about work a git operation could disturb — merge refuses on its own when an
+ * untracked file is in the way.
  */
-function dirtyEntries(root) {
-  const output = git(['-c', 'core.quotePath=false', 'status', '--porcelain'], root);
+function dirtyEntries(root, options = {}) {
+  const args = ['-c', 'core.quotePath=false', 'status', '--porcelain'];
+  if (options.untracked === false) args.push('--untracked-files=no');
+  const output = git(args, root);
   return output
     .split(/\r?\n/)
     .filter(Boolean)
@@ -172,18 +267,25 @@ module.exports = {
   IGNORE_LINE,
   OPT_OUT_FILE,
   WORKTREE_RELATIVE,
+  commonGitDir,
   dirtyEntries,
   git,
+  isBranchName,
   isEnabled,
   isInside,
   isLinkedWorktree,
   isOptedOut,
+  isWorktreeName,
   listWorktrees,
   mainRoot,
+  mergeTargetKey,
+  readMergeTargets,
   registeredWorktree,
   samePath,
   sessionSlug,
   toPosix,
   worktreeName,
+  worktreeNameFromPath,
   worktreePath,
+  writeMergeTarget,
 };

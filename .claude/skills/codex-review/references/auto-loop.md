@@ -19,6 +19,7 @@ Claude が応答を終えようとする
   → Claude が codex-review スキルを実行 → P0/P1/P2を修正（P3は対象外）
   → Step 7 で `--finalize-pending`を実行し、持ち越しとレビュー済み記録を同時に確定
   → レビュー対象ファイルだけを自動コミット（pushはしない）
+  → merge-reviewed.js で元のブランチへ merge
   → Claude が応答を終える → hook は「レビュー済み」なので通す
 ```
 
@@ -146,6 +147,7 @@ PreToolUse（worktree-guard.js）
   → Edit / Write / NotebookEdit の書き込み先が共有作業ツリー内 → deny
   → 拒否理由に実行すべき EnterWorktree を入れて返す
 実装 → Stop hook → レビュー → 修正 → 自動コミット（すべて worktree 内）
+  → merge だけは共有チェックアウト側で実行（そこへ届けるのが目的のため）
 ```
 
 ### なぜ hook が EnterWorktree を直接呼ばないのか
@@ -171,6 +173,66 @@ hook にできるのは「文脈を足す」ことと「ツール呼び出しを
   なるため、セッション再開後も自分の worktree を見つけられる
 - session_id をそのまま使わずハッシュするのは、**ブランチ名・パスとして不正な
   文字が来ても壊れないため**。異なる id が同じ worktree に落ちることもない
+
+### merge 先の記録と、共有チェックアウトの排他
+
+レビューと自動コミットが終わったら、`merge-reviewed.js` が worktree のブランチを
+**元のブランチへ merge する**。ここで問題になることが 2 つある。
+
+**1. 「元のブランチ」は観測できない。** merge の時点で共有チェックアウトが
+checkout しているブランチは、「今なにが開いているか」であって
+「この作業がどこから来たか」ではない。セッションは長く動くので、その間に利用者が
+`git switch` することはある。現在のブランチを merge 先にすると、
+**レビュー済みの変更が無関係なブランチへ入る**（再現確認済み）。
+
+そこで、**分離を指示する時点**（＝共有チェックアウトが、まさに worktree を切り出す
+ブランチにいる瞬間）に `mark-prompt.js` が記録する。
+
+```bash
+git config --local codexreview.<worktree名>.mergeInto <ブランチ名>
+```
+
+- キーは**ブランチ名ではなく worktree 名**。ブランチ名を付けるのは Claude Code なので、
+  記録が必要な時点ではまだ分からない。worktree 名は session_id から導出できる
+- 置き場所は**リポジトリの `.git/config`**。全 worktree で共有されるため、
+  セッションを再開しても同じ値を読める
+- **書くのは worktree がまだ無いときだけ。** 一度作られたら、以降は読むだけで書き換えない。
+  これで記録は「切り出した時点のブランチ」に固定される
+- merge 時は記録と現在のブランチが**一致するときだけ** merge する。違えば失敗して報告に回す。
+  記録が無い・複数ある・ブランチ名として不正・対象ブランチが消えている場合も、
+  推測せずに失敗する
+
+**「今 worktree の中にいるか」で判定してはいけない。** セッションを再開すると cwd は
+worktree の**外**（共有チェックアウト）に戻る — `mark-prompt.js` に
+`EnterWorktree(path:)` の分岐があるのは、まさにその状態のためにある。
+cwd で判定すると、再開のたびに記録が共有チェックアウトの現在ブランチへ書き換わり、
+**記録と現在ブランチが揃って動くので merge 時の照合をすり抜ける**。
+そのまま別ブランチへ merge して、しかも成功として報告される（再現確認済み）。
+判定に使うのは cwd ではなく、**worktree が存在するかどうか**。
+
+**2. 共有チェックアウトの index と作業ツリーは、リポジトリに 1 つしかない。**
+worktree を分けても、merge 先はどのセッションから見ても同じ 1 つのツリーになる。
+2 セッションが同時に merge すると `index.lock` / `update_ref` が失敗し、さらに
+**失敗した側が相手の `MERGE_HEAD` を見て `git merge --abort` する**ため、
+共有チェックアウトが half-merged のまま残る（20 回中 8 回で再現）。
+
+そのため merge は、**リポジトリ共通 git ディレクトリ単位のロック**
+（`lock-core.js`）の下で行う。
+
+- worktree ごとのロックでは意味がない。**排他したい相手が別の worktree にいる**
+- ロックを取ってから前提（統合先・進行中操作・dirty）を**取り直す**。
+  ロックの外で見た値は、merge する頃には古い
+- merge・必要な abort・HEAD と状態の最終確認まで**ロックを保持したまま**行う
+- 取れなければ git 操作を一切始めずに失敗する。merge されないことは復旧できるが、
+  half-merged な共有チェックアウトは復旧が難しい
+- **自分が開始した merge しか abort しない**（`MERGE_HEAD` が自分の source と一致する場合だけ）。
+  人が解決中の merge を巻き戻さない
+
+記録は worktree を消しても残る（このスキルは何も自動削除しない方針のため）。
+`.git/config` に使われないエントリが少しずつ増えるが、実害はない。気になる場合は
+`git worktree remove` と一緒に `git config --local --unset-all codexreview.<worktree名>.mergeInto`
+を手で実行する。**別セッションが記録直後で worktree 未作成の可能性があるため、
+スクリプトからの自動削除はしない。**
 
 ### 何が保証され、何が保証されないか
 
@@ -245,6 +307,18 @@ hook にできるのは「文脈を足す」ことと「ツール呼び出しを
   4 セッション同時停止で block が 1 件になることを実測で確認している
 - `setup-auto.js`の再実行・`--disable`は中断したclaimとretry予約を回収する。
   セットアップ中はStop hookが新しいclaimを作らない
+- **共有チェックアウトへのmergeは1セッションずつ。** リポジトリ共通gitディレクトリ単位の
+  ロックを取ってから前提を取り直し、merge・abort・最終確認まで保持する。
+  2 worktreeからの同時merge 20回で、共有チェックアウトがcleanなまま両方入ることを実測で確認している
+
+## テスト
+
+`merge-reviewed.js` には自動テストがある。一時ディレクトリの隔離gitリポジトリで動き、
+`HOME` / `USERPROFILE` も一時ディレクトリへ差し替えるため、利用者の状態には触れない。
+
+```bash
+node --test .claude/skills/codex-review/tests/merge-reviewed.test.js
+```
 
 ## ループが止まる仕組み
 
@@ -277,6 +351,9 @@ hook にできるのは「文脈を足す」ことと「ツール呼び出しを
 | 未コミット変更があると言われて進まない | 共有作業ツリーの変更をコミットするか、`.codex-review-no-worktree`で分離を無効化する。スキルはstash / resetをしない |
 | worktreeが増えすぎた | `git worktree list`で確認し、統合済みのものを`git worktree remove`で消す（スキルは自動削除しない） |
 | worktreeがorigin基準で作られる | `.claude/settings.local.json`の`worktree.baseRef`が`"fresh"`になっている。`"head"`にする |
+| 「統合先は X です」と言われてmergeされない | 共有チェックアウトが別のブランチへ切り替わっている。`git switch X`で戻してから再実行する。別ブランチへのmergeはしない |
+| 「統合先が記録されていない」と言われる | `mark-prompt.js`が記録する前に作られたworktree。エラーに出る`git config --local --replace-all codexreview.<worktree名>.mergeInto <ブランチ名>`を共有チェックアウトで実行する |
+| mergeロックが取れないと言われる | 別セッションがmerge中。終わるまで待って再実行する。所有プロセスが停止していれば5分後に自動回収される。所有マーカーが壊れたロックだけは自動回収せず、パスをエラーに出して停止するので、内容を確認して手で消す |
 
 手で試すには:
 
