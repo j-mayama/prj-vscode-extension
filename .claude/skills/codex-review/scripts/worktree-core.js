@@ -23,8 +23,8 @@
 
 const { execFileSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
-const { existsSync } = require('node:fs');
-const { isAbsolute, join, relative, resolve, sep } = require('node:path');
+const { existsSync, realpathSync } = require('node:fs');
+const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path');
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -86,9 +86,42 @@ function samePath(left, right) {
 }
 
 /**
+ * The path as the filesystem itself spells it: 8.3 short names expanded,
+ * symlinks resolved, casing as recorded.
+ *
+ * Two names for one directory is not a curiosity on Windows. `%TEMP%` is
+ * commonly the 8.3 form (`C:\Users\LONGNA~1\...`) while git answers with the
+ * long one, and a `subst` drive or a symlinked checkout does the same thing.
+ * Anything comparing "is this write inside the shared checkout?" by path
+ * arithmetic then decides *no* for a path that plainly is, and a guard that
+ * answers no fails open — silently, looking exactly like a tree that needed no
+ * guarding.
+ *
+ * Walks up to the nearest existing ancestor, because the target of a write does
+ * not exist yet by definition. Any resolution failure falls back to the plain
+ * resolved path: a canonicalizer that throws would be worse than one that
+ * occasionally agrees with `resolve()`.
+ */
+function canonicalPath(target) {
+  let current = resolve(target);
+  const tail = [];
+  for (;;) {
+    try {
+      return join(realpathSync.native(current), ...tail);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return resolve(target);
+      tail.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
  * True when `child` is `parent` itself or sits underneath it. Uses path
  * arithmetic rather than string prefixes so `/repo-2` is not read as inside
- * `/repo`.
+ * `/repo`. Callers comparing paths from different sources must canonicalize
+ * both first — see canonicalPath().
  */
 function isInside(parent, child) {
   const rel = relative(resolve(parent), resolve(child));
@@ -253,6 +286,89 @@ function dirtyEntries(root, options = {}) {
     });
 }
 
+/**
+ * Git operations that leave a half-finished state behind. Starting anything on
+ * top of one of these compounds an operation someone else left open, and an
+ * `--abort` afterwards would unwind the wrong one.
+ */
+const IN_PROGRESS = [
+  'MERGE_HEAD',
+  'CHERRY_PICK_HEAD',
+  'REVERT_HEAD',
+  'rebase-merge',
+  'rebase-apply',
+];
+
+function gitDir(root) {
+  return git(['rev-parse', '--path-format=absolute', '--git-dir'], root).trim();
+}
+
+/** The interrupted git operation blocking this checkout, or null when there is none. */
+function inProgressOperation(root) {
+  const dir = gitDir(root);
+  return IN_PROGRESS.find((entry) => existsSync(join(dir, entry))) ?? null;
+}
+
+/**
+ * The checked-out branch, or null when HEAD is not on one.
+ *
+ * `symbolic-ref` rather than `rev-parse --abbrev-ref HEAD`, and the prefix is
+ * stripped here rather than with `--short`. Both of those shorten a ref only as
+ * far as it stays *unambiguous*: create a tag named `main` and either one starts
+ * answering `heads/main`, which then becomes `refs/heads/heads/main` downstream
+ * and fails to resolve (verified). Tags outrank heads in git's resolution order,
+ * so this is not a hypothetical — and the failure lands on the merge, after the
+ * work is done.
+ *
+ * Also resolves on an unborn branch, where `rev-parse HEAD` cannot: "which
+ * branch is checked out" has an answer before the first commit.
+ */
+function currentBranch(root) {
+  let ref;
+  try {
+    ref = git(['symbolic-ref', '--quiet', 'HEAD'], root).trim();
+  } catch (error) {
+    // Exit 1 is git's "HEAD is not a symbolic ref", i.e. detached.
+    if (error.status === 1) return null;
+    throw error;
+  }
+  return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : null;
+}
+
+/**
+ * Branch names reach git only as `refs/heads/<name>`, never bare. A fully
+ * qualified ref cannot start with `-`, so no branch name — however hostile, and
+ * whoever created it — is parseable as an option, and a same-named tag cannot
+ * shadow it (tags outrank heads in git's resolution order).
+ */
+function headsRef(branch) {
+  return `refs/heads/${branch}`;
+}
+
+function commitOf(root, branch) {
+  return git(['rev-parse', '--verify', `${headsRef(branch)}^{commit}`], root).trim();
+}
+
+function branchExists(root, branch) {
+  try {
+    git(['show-ref', '--verify', '--quiet', headsRef(branch)], root);
+    return true;
+  } catch (error) {
+    if (error.status === 1) return false;
+    throw error;
+  }
+}
+
+function isAncestor(root, ancestor, descendant) {
+  try {
+    git(['merge-base', '--is-ancestor', ancestor, descendant], root);
+    return true;
+  } catch (error) {
+    if (error.status === 1) return false;
+    throw error;
+  }
+}
+
 function isEnabled(main) {
   return existsSync(join(main, FLAG_FILE));
 }
@@ -265,11 +381,20 @@ function isOptedOut(main) {
 module.exports = {
   FLAG_FILE,
   IGNORE_LINE,
+  IN_PROGRESS,
   OPT_OUT_FILE,
   WORKTREE_RELATIVE,
+  branchExists,
+  canonicalPath,
+  commitOf,
   commonGitDir,
+  currentBranch,
   dirtyEntries,
   git,
+  gitDir,
+  headsRef,
+  inProgressOperation,
+  isAncestor,
   isBranchName,
   isEnabled,
   isInside,

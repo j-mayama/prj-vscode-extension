@@ -41,19 +41,35 @@
  *
  * Output (stdout, one line):
  *   MERGED <branch> <sha> fast-forward|merge-commit
+ *   REVIEW_REQUIRED <branch> <sha> conflicts=<count>
  *   UP_TO_DATE <branch>
  *   SKIPPED <reason>
  */
 
-const { existsSync, readFileSync } = require('node:fs');
-const { join } = require('node:path');
+const { createHash } = require('node:crypto');
+const { lstatSync, readFileSync, readlinkSync } = require('node:fs');
+const { join, resolve } = require('node:path');
 
 const { withLock } = require('./lock-core.js');
-const { STATE_DIR, ensureStateDir, stateKey } = require('./state-core.js');
 const {
+  STATE_DIR,
+  ensureStateDir,
+  readState,
+  stateKey,
+  withStateLock,
+  writeState,
+} = require('./state-core.js');
+const {
+  branchExists,
+  commitOf,
   commonGitDir,
+  currentBranch,
   dirtyEntries,
   git,
+  gitDir,
+  headsRef,
+  inProgressOperation,
+  isAncestor,
   isBranchName,
   isLinkedWorktree,
   mainRoot,
@@ -63,80 +79,197 @@ const {
 } = require('./worktree-core.js');
 
 /**
- * A merge started on top of one of these would compound an operation the user
- * (or another session) left half-finished, and `--abort` would then unwind the
- * wrong one.
- */
-const IN_PROGRESS = [
-  'MERGE_HEAD',
-  'CHERRY_PICK_HEAD',
-  'REVERT_HEAD',
-  'rebase-merge',
-  'rebase-apply',
-];
-
-/**
  * Long enough that a session queued behind another session's merge waits it out
  * rather than reporting a failure the user would have to resolve by hand; short
  * enough to surface a genuinely stuck holder instead of hanging the turn.
  */
 const LOCK_TIMEOUT_MS = 60 * 1000;
 
+class ReviewRequired extends Error {
+  constructor(target, targetHead, sourceHead) {
+    super(`${target}の${targetHead}を${sourceHead}へ取り込み、競合解消後に再レビューする必要があります`);
+    this.target = target;
+    this.targetHead = targetHead;
+    this.sourceHead = sourceHead;
+  }
+}
+
 function die(message) {
   process.stderr.write(`codex-review: ${message}\n`);
   process.exit(1);
 }
 
-function gitDir(root) {
-  return git(['rev-parse', '--path-format=absolute', '--git-dir'], root).trim();
-}
-
-function inProgressOperation(root) {
-  const dir = gitDir(root);
-  return IN_PROGRESS.find((entry) => existsSync(join(dir, entry))) ?? null;
-}
-
-/** The checked-out branch, or null when HEAD is detached. */
-function currentBranch(root) {
-  const name = git(['rev-parse', '--abbrev-ref', 'HEAD'], root).trim();
-  return name === 'HEAD' ? null : name;
+function gitOutput(error) {
+  return `${error.stdout ?? ''}${error.stderr ?? ''}`.trim();
 }
 
 /**
- * Branch names reach git only as `refs/heads/<name>`, never bare. A fully
- * qualified ref cannot start with `-`, so no branch name — however hostile, and
- * whoever created it — is parseable as an option.
+ * Computes the recursive merge result without touching an index or worktree.
+ * Exit 1 plus a leading tree id is git merge-tree's documented conflict result;
+ * every other failure remains fatal rather than being mistaken for a conflict.
  */
-function headsRef(branch) {
-  return `refs/heads/${branch}`;
-}
-
-function commitOf(root, branch) {
-  return git(['rev-parse', '--verify', `${headsRef(branch)}^{commit}`], root).trim();
-}
-
-function branchExists(root, branch) {
+function mergeTreePlan(root, left, right) {
   try {
-    git(['show-ref', '--verify', '--quiet', headsRef(branch)], root);
-    return true;
+    const output = git(['merge-tree', '--write-tree', left, right], root);
+    const tree = output.split(/\r?\n/, 1)[0].trim();
+    if (!/^[0-9a-f]{40,64}$/.test(tree)) {
+      throw new Error(`git merge-tree が不正なtreeを返しました: ${JSON.stringify(tree)}`);
+    }
+    return { conflicted: false, tree };
   } catch (error) {
-    if (error.status === 1) return false;
-    throw error;
+    const output = gitOutput(error);
+    const tree = output.split(/\r?\n/, 1)[0].trim();
+    if (error.status === 1 && /^[0-9a-f]{40,64}$/.test(tree)) {
+      return { conflicted: true, tree };
+    }
+    throw new Error(`merge結果を事前計算できませんでした:\n${output || error.message}`);
   }
 }
 
-function isAncestor(root, ancestor, descendant) {
-  try {
-    git(['merge-base', '--is-ancestor', ancestor, descendant], root);
-    return true;
-  } catch (error) {
-    if (error.status === 1) return false;
-    throw error;
-  }
+function nulPaths(output) {
+  return output.split('\0').filter(Boolean).map((path) => path.replace(/\\/g, '/'));
 }
 
-function gitOutput(error) {
-  return `${error.stdout ?? ''}${error.stderr ?? ''}`.trim();
+function pathsCollide(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+/** Visible untracked files that a source tree would turn into tracked paths. */
+function untrackedCollisions(root, sourceHead) {
+  const untracked = nulPaths(git(['ls-files', '--others', '--exclude-standard', '-z'], root));
+  if (untracked.length === 0) return [];
+  const incoming = nulPaths(git(['ls-tree', '-r', '--name-only', '-z', sourceHead], root));
+  return untracked.filter((local) => incoming.some((tracked) => pathsCollide(local, tracked)));
+}
+
+/** Hash local bytes so a no-checkout merge can prove it did not overwrite them. */
+function localSnapshot(root, files) {
+  return Object.fromEntries(files.map((file) => {
+    const absolute = resolve(root, file);
+    const stat = lstatSync(absolute);
+    const hash = createHash('sha256');
+    if (stat.isSymbolicLink()) hash.update(`symlink:${readlinkSync(absolute)}`);
+    else if (stat.isFile()) hash.update(readFileSync(absolute));
+    else throw new Error(`未追跡パスが通常ファイルまたはsymlinkではありません: ${file}`);
+    return [file, hash.digest('hex')];
+  }));
+}
+
+/**
+ * Advance the target without checking out the merged tree. This is used only
+ * when a visible untracked file occupies a path the source commit tracks.
+ * `git merge` would stop to avoid overwriting it; updating the ref and then the
+ * index with `reset --mixed` keeps the local bytes untouched. The path becomes
+ * an ordinary unstaged tracked modification, while the reviewed bytes live in
+ * the target commit.
+ */
+function mergePreservingUntracked(shared, source, target, before, sourceHead, collisions, mergeTree) {
+  const localBefore = localSnapshot(shared, collisions);
+  let merged;
+  let kind;
+
+  if (isAncestor(shared, before, sourceHead)) {
+    merged = sourceHead;
+    kind = 'fast-forward';
+  } else {
+    merged = git(
+      ['commit-tree', mergeTree, '-p', before, '-p', sourceHead, '-m', `Merge branch '${source}'`],
+      shared,
+    ).trim();
+    kind = 'merge-commit';
+  }
+
+  const targetRef = headsRef(target);
+  let refUpdated = false;
+  try {
+    git(['update-ref', '-m', `merge ${source} (preserve local untracked files)`, targetRef, merged, before], shared);
+    refUpdated = true;
+    git(['reset', '--mixed', '--quiet', merged], shared);
+  } catch (error) {
+    if (!refUpdated) {
+      throw new Error(`未追跡ファイル保持mergeを開始できませんでした（HEADは変更していません）:\n${gitOutput(error)}`);
+    }
+    // reset --mixed never writes working-tree files. If updating the real index
+    // still fails, put the branch and index back before reporting the failure.
+    try {
+      git(['update-ref', '-m', `rollback failed merge ${source}`, targetRef, before, merged], shared);
+      git(['reset', '--mixed', '--quiet', before], shared);
+    } catch (rollbackError) {
+      throw new Error(
+        `未追跡ファイル保持mergeの復元に失敗しました。手動確認が必要です:\n`
+          + `${gitOutput(error)}\n${gitOutput(rollbackError)}`,
+      );
+    }
+    throw new Error(`未追跡ファイル保持mergeに失敗し、元のHEADへ戻しました:\n${gitOutput(error)}`);
+  }
+
+  const localAfter = localSnapshot(shared, collisions);
+  if (JSON.stringify(localAfter) !== JSON.stringify(localBefore)) {
+    throw new Error('merge後に未追跡ファイルの内容が変化しました。手動確認が必要です');
+  }
+  if (inProgressOperation(shared)) {
+    throw new Error('未追跡ファイル保持merge後にgit操作途中の状態が残っています');
+  }
+  if (currentBranch(shared) !== target || commitOf(shared, target) !== merged) {
+    throw new Error('未追跡ファイル保持merge後のブランチまたはHEADが想定と一致しません');
+  }
+  if (!isAncestor(shared, sourceHead, merged)) {
+    throw new Error('未追跡ファイル保持mergeにレビュー済みコミットが含まれていません');
+  }
+
+  process.stdout.write(`MERGED ${target} ${merged} ${kind} preserved-untracked=${collisions.length}\n`);
+  return 0;
+}
+
+/** Paths still requiring human/agent resolution in this session worktree. */
+function conflictedPaths(root) {
+  return nulPaths(git(['diff', '--name-only', '--diff-filter=U', '-z'], root));
+}
+
+/**
+ * Move a conflict out of the shared checkout and into this session's isolated
+ * worktree. `--no-commit --no-ff` deliberately leaves even a clean integration
+ * uncommitted: the combined result must pass Codex review before it can move the
+ * target branch.
+ */
+function prepareReview(worktree, source, request) {
+  if (currentBranch(worktree) !== source) {
+    throw new Error(`再レビュー準備前にworktreeのブランチが${source}から変わりました`);
+  }
+  if (commitOf(worktree, source) !== request.sourceHead) {
+    throw new Error('再レビュー準備前にworktreeのHEADが変わりました。現在の状態からmergeを再実行してください');
+  }
+  const blocked = inProgressOperation(worktree);
+  if (blocked) {
+    throw new Error(`専用worktreeで${blocked}が進行中です。解消・再レビュー・コミット後にmergeを再実行してください`);
+  }
+  const dirty = dirtyEntries(worktree);
+  if (dirty.length > 0) {
+    throw new Error(`専用worktreeに未コミット変更があるため再レビュー用mergeを開始しません:\n${dirty.join('\n')}`);
+  }
+
+  let detail = '';
+  try {
+    git([
+      'merge', '--no-commit', '--no-ff', '-m',
+      `Merge branch '${request.target}' into '${source}' for review`,
+      request.targetHead,
+    ], worktree);
+  } catch (error) {
+    detail = gitOutput(error);
+  }
+
+  const pending = mergeHeads(worktree);
+  if (!pending || pending.length !== 1 || pending[0] !== request.targetHead) {
+    throw new Error(
+      `再レビュー用mergeを開始できませんでした（期待MERGE_HEAD=${request.targetHead}）:\n${detail}`,
+    );
+  }
+  const conflicts = conflictedPaths(worktree);
+  process.stdout.write(
+    `REVIEW_REQUIRED ${request.target} ${request.targetHead} conflicts=${conflicts.length}\n`,
+  );
+  return 0;
 }
 
 /**
@@ -242,16 +375,28 @@ function mergeUnderLock(shared, source, target) {
     return 0;
   }
 
-  // Untracked files are not a reason to stop: git refuses on its own if the
-  // merge would overwrite one. Tracked changes are — `git merge --abort` is
-  // documented as unable to reconstruct uncommitted work in some cases, so a
-  // conflict here could destroy whatever the shared checkout was holding.
+  // Tracked changes still stop a normal merge. A visible untracked file is
+  // different: if the source tracks the same path, use a no-checkout merge that
+  // preserves its bytes as an unstaged local modification.
   const dirty = dirtyEntries(shared, { untracked: false });
   if (dirty.length) {
     throw new Error(
       `共有チェックアウト（${target}）に未コミット変更があるためmergeしません。`
         + `コミットするか退避してから統合してください:\n${dirty.join('\n')}`,
     );
+  }
+
+  const fastForward = isAncestor(shared, before, sourceHead);
+  let mergeTree = null;
+  if (!fastForward) {
+    const plan = mergeTreePlan(shared, before, sourceHead);
+    if (plan.conflicted) throw new ReviewRequired(target, before, sourceHead);
+    mergeTree = plan.tree;
+  }
+
+  const collisions = untrackedCollisions(shared, sourceHead);
+  if (collisions.length > 0) {
+    return mergePreservingUntracked(shared, source, target, before, sourceHead, collisions, mergeTree);
   }
 
   const restorePoint = snapshot(shared);
@@ -302,7 +447,7 @@ function mergeUnderLock(shared, source, target) {
       );
     }
     assertRestored(shared, restorePoint, detail);
-    throw new Error(`${target}へのmergeに失敗しました（${target}は${before.slice(0, 7)}のままです）:\n${detail}`);
+    throw new ReviewRequired(target, before, sourceHead);
   }
 
   // Still under the lock: a merge that reported success but left the checkout
@@ -324,6 +469,34 @@ function mergeUnderLock(shared, source, target) {
   const kind = merged === sourceHead ? 'fast-forward' : 'merge-commit';
   process.stdout.write(`MERGED ${target} ${merged} ${kind}\n`);
   return 0;
+}
+
+/**
+ * Records that this source commit was actually run through a merge, and how it
+ * went. stop-hook.js reads this to tell "nobody tried" from "tried and it could
+ * not be done", which are the two situations that need opposite handling: the
+ * first has to keep asking, the second must not trap the session.
+ *
+ * Keyed on the source commit, so a new commit is judged on its own. Deliberately
+ * best effort: the merge has already happened by the time this runs, and losing
+ * the note costs at most one extra reminder — throwing here would turn a
+ * successful merge into a failed command.
+ */
+function recordAttempt(worktreeRoot, sourceHead, result) {
+  try {
+    withStateLock(worktreeRoot, () => {
+      const state = readState(worktreeRoot, { strict: true });
+      writeState(worktreeRoot, {
+        ...state,
+        merge: { head: sourceHead, result, at: new Date().toISOString() },
+      });
+    });
+  } catch (error) {
+    process.stderr.write(
+      `codex-review: merge結果を状態ファイルへ記録できませんでした（${error.message}）。`
+        + 'Stop hookが同じmergeをもう一度要求する可能性があります\n',
+    );
+  }
 }
 
 function main() {
@@ -349,7 +522,19 @@ function main() {
     );
   }
 
-  const target = recordedTarget(shared, name);
+  // Captured before anything is attempted, so every outcome below — including a
+  // failure to even resolve the target — is attributed to the commit the caller
+  // asked to integrate.
+  const sourceHead = commitOf(cwd, source);
+
+  let target;
+  try {
+    target = recordedTarget(shared, name);
+  } catch (error) {
+    recordAttempt(worktreeRoot, sourceHead, 'failed');
+    throw error;
+  }
+
   if (target === source) {
     process.stdout.write('SKIPPED same-branch\n');
     return 0;
@@ -361,10 +546,28 @@ function main() {
   // recoverable, a half-merged shared checkout is the thing worth avoiding.
   ensureStateDir();
   const lock = join(STATE_DIR, `${stateKey(commonGitDir(cwd))}.merge.lock`);
-  return withLock(lock, () => mergeUnderLock(shared, source, target), {
-    label: `共有チェックアウト（${shared}）のmergeロック`,
-    timeoutMs: LOCK_TIMEOUT_MS,
-  });
+  try {
+    const code = withLock(lock, () => mergeUnderLock(shared, source, target), {
+      label: `共有チェックアウト（${shared}）のmergeロック`,
+      timeoutMs: LOCK_TIMEOUT_MS,
+    });
+    recordAttempt(worktreeRoot, sourceHead, 'completed');
+    return code;
+  } catch (error) {
+    if (!(error instanceof ReviewRequired)) {
+      recordAttempt(worktreeRoot, sourceHead, 'failed');
+      throw error;
+    }
+    let code;
+    try {
+      code = prepareReview(worktreeRoot, source, error);
+    } catch (prepareError) {
+      recordAttempt(worktreeRoot, sourceHead, 'failed');
+      throw prepareError;
+    }
+    recordAttempt(worktreeRoot, sourceHead, 'review-required');
+    return code;
+  }
 }
 
 try {

@@ -29,7 +29,7 @@
 const { spawnSync } = require('node:child_process');
 const { existsSync, readdirSync, statSync } = require('node:fs');
 const { homedir } = require('node:os');
-const { delimiter, join } = require('node:path');
+const { delimiter, dirname, join, resolve } = require('node:path');
 
 const { CONFIG_PATH, readConfig } = require('./config-core.js');
 
@@ -183,6 +183,38 @@ function checkRef(scope) {
     : `ブランチ '${value}' が見つかりません`;
 }
 
+/** Review output is an execution artifact, never a repository change. */
+function checkOutFile(outFile, cwd = process.cwd(), env = process.env) {
+  if (!outFile) return '--outを指定してください';
+  const rootRun = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd,
+    env,
+    encoding: 'utf8',
+    shell: false,
+  });
+  if (rootRun.status !== 0) {
+    return `gitリポジトリのルートを確認できません: ${(rootRun.stderr ?? '').trim()}`;
+  }
+  const requested = resolve(cwd, outFile);
+  const parent = dirname(requested);
+  if (!existsSync(parent)) return `レビュー出力先のディレクトリが存在しません: ${parent}`;
+
+  // Ask git from the output directory instead of comparing Windows path text.
+  // TEMP commonly uses an 8.3 short path while git reports the same directory
+  // with its long name; textual containment would therefore miss an in-repo
+  // output on Windows. Any git worktree is the wrong place for a scratch file.
+  const outputRepo = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+    cwd: parent,
+    env,
+    encoding: 'utf8',
+    shell: false,
+  });
+  if (outputRepo.status === 0 && outputRepo.stdout.trim() === 'true') {
+    return 'レビュー出力はリポジトリ外のscratchpadまたは一時ディレクトリへ保存してください';
+  }
+  return null;
+}
+
 function buildReviewArgs(config, scope, outFile) {
   const args = ['exec', 'review', ...(scope ?? ['--uncommitted'])];
   if (config.mode !== 'inherit' && config.model) args.push('-m', config.model);
@@ -200,6 +232,12 @@ function main() {
   const { scope, outFile } = parseArgs(process.argv.slice(2));
   if (!outFile) {
     log('使い方: node run-review.js --out <file> [--uncommitted | --base <branch> | --commit <sha>]');
+    return 1;
+  }
+
+  const badOutFile = checkOutFile(outFile);
+  if (badOutFile) {
+    process.stdout.write(`NG: ${badOutFile}\n`);
     return 1;
   }
 
@@ -280,6 +318,6 @@ function main() {
 }
 
 // doctor.js reuses the resolver. Two copies of "where is codex" would drift.
-module.exports = { buildReviewArgs, resolveCodex, readConfig, CONFIG_PATH };
+module.exports = { buildReviewArgs, checkOutFile, resolveCodex, readConfig, CONFIG_PATH };
 
 if (require.main === module) process.exit(main());

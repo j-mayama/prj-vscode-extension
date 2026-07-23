@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * merge-reviewed.js の自動テスト。
+ * merge-reviewed.js を中心とした、worktree分離フロー全体の自動テスト。
  *
  *   node --test .claude/skills/codex-review/tests/
  *
@@ -17,183 +17,39 @@
  * 組み立てていれば、ここで壊れる。
  */
 
+
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { execFile, execFileSync } = require('node:child_process');
-const {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} = require('node:fs');
-const { tmpdir } = require('node:os');
+const { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } = require('node:fs');
 const { join, resolve } = require('node:path');
 
-const { stateKey } = require('../scripts/state-core.js');
 const { withLock } = require('../scripts/lock-core.js');
 const { worktreeName } = require('../scripts/worktree-core.js');
-
-const SCRIPTS = resolve(__dirname, '..', 'scripts');
-const MERGE_REVIEWED = join(SCRIPTS, 'merge-reviewed.js');
-const MARK_PROMPT = join(SCRIPTS, 'mark-prompt.js');
-
-// 空白入りのプレフィックス。パスがシェルで再解釈されるなら全テストが落ちる。
-const TMP_PREFIX = 'codex merge test ';
-
-function run(args, options = {}) {
-  return execFileSync(args[0], args.slice(1), {
-    encoding: 'utf8',
-    // `input` is silently dropped when stdio[0] is 'ignore', so stdin has to be
-    // a pipe whenever the caller has something to feed the process.
-    stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-    ...options,
-  });
-}
-
-/** 終了コードを例外にせず、stdout / stderr と一緒に返す。 */
-function tryRun(args, options) {
-  try {
-    return { code: 0, stdout: run(args, options), stderr: '' };
-  } catch (error) {
-    return {
-      code: typeof error.status === 'number' ? error.status : 1,
-      stdout: error.stdout ?? '',
-      stderr: error.stderr ?? String(error.message),
-    };
-  }
-}
-
-function runAsync(args, options) {
-  return new Promise((done) => {
-    execFile(args[0], args.slice(1), { encoding: 'utf8', ...options }, (error, stdout, stderr) => {
-      done({
-        code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
-        stdout: stdout ?? '',
-        stderr: stderr ?? '',
-      });
-    });
-  });
-}
-
-function sleep(ms) {
-  return new Promise((done) => {
-    setTimeout(done, ms);
-  });
-}
-
-/**
- * 隔離リポジトリ一式。
- *
- * `setup-auto.js` が作る構成に合わせる（フラグ・`.gitignore`・worktree置き場）。
- * 揃えないと mark-prompt.js は「共有ツリーがdirty」と判断し、統合先を記録しない。
- */
-function fixture(t, options = {}) {
-  const base = mkdtempSync(join(tmpdir(), TMP_PREFIX));
-  t.after(() => {
-    try {
-      rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    } catch {
-      // 一時ディレクトリなので、Windowsのread-onlyなpackファイルで消せなくても放置する。
-    }
-  });
-
-  const home = join(base, 'home dir');
-  const shared = join(base, 'shared checkout');
-  mkdirSync(home, { recursive: true });
-  mkdirSync(shared, { recursive: true });
-
-  const env = {
-    ...process.env,
-    HOME: home,
-    USERPROFILE: home,
-    // 利用者のグローバル設定（merge.ff / commit.gpgsign 等）を持ち込まない。
-    GIT_CONFIG_GLOBAL: join(home, 'gitconfig'),
-    GIT_CONFIG_SYSTEM: join(home, 'gitconfig-system'),
-    GIT_TERMINAL_PROMPT: '0',
-  };
-
-  const branch = options.branch ?? 'main';
-  const git = (args, cwd = shared) => run(['git', ...args], { cwd, env });
-
-  git(['init', '-b', branch, '.']);
-  git(['config', 'user.email', 'test@example.com']);
-  git(['config', 'user.name', 'codex-review test']);
-  git(['config', 'commit.gpgsign', 'false']);
-
-  writeFileSync(join(shared, '.gitignore'), '.codex-review-auto\n.claude/settings.local.json\n.claude/worktrees/\n');
-  writeFileSync(join(shared, 'sentinel.txt'), 'sentinel-original\n');
-  writeFileSync(join(shared, 'shared-file.txt'), 'base\n');
-  git(['add', '.gitignore', 'sentinel.txt', 'shared-file.txt']);
-  git(['commit', '-m', 'initial']);
-  writeFileSync(join(shared, '.codex-review-auto'), '');
-
-  const commonDir = resolve(git(['rev-parse', '--path-format=absolute', '--git-common-dir']).trim());
-  const lockPath = join(home, '.claude', 'codex-review-state', `${stateKey(commonDir)}.merge.lock`);
-
-  return { base, home, shared, env, git, branch, lockPath };
-}
-
-/**
- * 実際の `UserPromptSubmit` hook を通して統合先を記録する。テスト側で
- * `git config` を直接書くと、記録経路そのものが検証されない。
- */
-function markPrompt(fx, sessionId) {
-  return tryRun(['node', MARK_PROMPT], {
-    cwd: fx.shared,
-    env: fx.env,
-    input: JSON.stringify({ cwd: fx.shared, session_id: sessionId }),
-  });
-}
-
-/** mark-prompt で統合先を記録してから、そのセッションのworktreeを作る。 */
-function addWorktree(fx, sessionId) {
-  markPrompt(fx, sessionId);
-  const name = worktreeName(sessionId);
-  const path = join(fx.shared, '.claude', 'worktrees', name);
-  const branch = `worktree-${name}`;
-  fx.git(['worktree', 'add', '-b', branch, path, 'HEAD']);
-  return { name, path, branch };
-}
-
-function commitIn(fx, cwd, file, content, message) {
-  writeFileSync(join(cwd, file), content);
-  fx.git(['add', '--', file], cwd);
-  fx.git(['commit', '-m', message], cwd);
-  return fx.git(['rev-parse', 'HEAD'], cwd).trim();
-}
-
-function mergeReviewed(fx, cwd) {
-  return tryRun(['node', MERGE_REVIEWED], { cwd, env: fx.env });
-}
-
-function state(fx) {
-  return {
-    head: fx.git(['rev-parse', 'HEAD']).trim(),
-    branch: fx.git(['rev-parse', '--abbrev-ref', 'HEAD']).trim(),
-    status: fx.git(['status', '--porcelain']),
-  };
-}
-
-function shaOf(fx, ref, cwd = fx.shared) {
-  return fx.git(['rev-parse', '--verify', ref], cwd).trim();
-}
-
-function isAncestor(fx, ancestor, descendant) {
-  return tryRun(['git', 'merge-base', '--is-ancestor', ancestor, descendant], {
-    cwd: fx.shared,
-    env: fx.env,
-  }).code === 0;
-}
-
-function recordedTarget(fx, name) {
-  return tryRun(['git', 'config', '--local', '--get-all', `codexreview.${name}.mergeInto`], {
-    cwd: fx.shared,
-    env: fx.env,
-  }).stdout.trim();
-}
+const { checkOutFile } = require('../scripts/run-review.js');
+const {
+  COMMIT_REVIEWED,
+  DOCTOR,
+  MERGE_REVIEWED,
+  SCRIPTS,
+  SETUP_AUTO,
+  STOP_HOOK,
+  WORKTREE_GUARD,
+  addWorktree,
+  commitIn,
+  fixture,
+  gitOperationFile,
+  isAncestor,
+  markPrompt,
+  mergeReviewed,
+  recordedTarget,
+  reviewedCommitAll,
+  run,
+  runAsync,
+  shaOf,
+  sleep,
+  state,
+  tryRun,
+} = require('./helpers.js');
 
 // ---------------------------------------------------------------------------
 // 1. fast-forward merge
@@ -289,15 +145,15 @@ test('共有側に未コミットの追跡変更があるとmergeせず、sentin
 });
 
 // ---------------------------------------------------------------------------
-// 5. 衝突時にabortされ、HEAD・index・working treeが実行前と一致
+// 5. 衝突を専用worktreeへ移し、再レビュー・コミット後に再試行する
 // ---------------------------------------------------------------------------
 
-test('衝突したらabortして、HEAD・index・working treeを実行前へ戻す', (t) => {
+test('衝突したら共有側を変えず専用worktreeで解消・再コミットしてmergeを再試行する', (t) => {
   const fx = fixture(t);
   const wt = addWorktree(fx, 'session-conflict');
 
-  commitIn(fx, wt.path, 'shared-file.txt', 'from worktree\n', 'edit in worktree');
-  commitIn(fx, fx.shared, 'shared-file.txt', 'from shared\n', 'edit in shared');
+  const sourceCommit = commitIn(fx, wt.path, 'shared-file.txt', 'from worktree\n', 'edit in worktree');
+  const targetCommit = commitIn(fx, fx.shared, 'shared-file.txt', 'from shared\n', 'edit in shared');
 
   const before = state(fx);
   const contentBefore = readFileSync(join(fx.shared, 'shared-file.txt'), 'utf8');
@@ -305,35 +161,82 @@ test('衝突したらabortして、HEAD・index・working treeを実行前へ戻
 
   const result = mergeReviewed(fx, wt.path);
 
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /mergeに失敗しました/);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim(), `REVIEW_REQUIRED main ${targetCommit} conflicts=1`);
   assert.deepEqual(state(fx), before, 'HEAD・statusとも実行前と一致');
   assert.equal(readFileSync(join(fx.shared, 'shared-file.txt'), 'utf8'), contentBefore, '衝突マーカーが残っていない');
   assert.equal(fx.git(['diff', 'HEAD']), diffBefore, 'indexにも差分が残っていない');
   assert.ok(!existsSync(join(fx.shared, '.git', 'MERGE_HEAD')), 'merge途中の状態が残っていない');
+  assert.ok(existsSync(gitOperationFile(fx, wt.path, 'MERGE_HEAD')), '専用worktreeだけがmerge途中になる');
+  assert.match(readFileSync(join(wt.path, 'shared-file.txt'), 'utf8'), /<{7}/, '専用worktreeには解消対象がある');
+
+  writeFileSync(join(wt.path, 'shared-file.txt'), 'from shared\nfrom worktree\n');
+  fx.git(['add', '--', 'shared-file.txt'], wt.path);
+  const committed = reviewedCommitAll(fx, wt.path, 'resolve reviewed integration');
+  assert.equal(committed.code, 0, committed.stderr);
+  assert.match(committed.stdout, /COMMITTED [0-9a-f]{40,64}/);
+  assert.ok(!existsSync(gitOperationFile(fx, wt.path, 'MERGE_HEAD')), 'レビュー済み解消結果をコミットした');
+
+  const retried = mergeReviewed(fx, wt.path);
+  assert.equal(retried.code, 0, retried.stderr);
+  assert.match(retried.stdout, /^MERGED main [0-9a-f]{40,64} fast-forward\s*$/);
+  assert.equal(readFileSync(join(fx.shared, 'shared-file.txt'), 'utf8'), 'from shared\nfrom worktree\n');
+  fx.git(['merge-base', '--is-ancestor', sourceCommit, 'main']);
+  fx.git(['merge-base', '--is-ancestor', targetCommit, 'main']);
+});
+
+test('3セッションが同じ行を変更しても解消・再レビュー・再試行で全コミットを統合する', (t) => {
+  const fx = fixture(t);
+  const sessions = ['parallel-a', 'parallel-b', 'parallel-c'].map((id) => addWorktree(fx, id));
+  const commits = sessions.map((wt, index) =>
+    commitIn(fx, wt.path, 'shared-file.txt', `session-${index + 1}\n`, `session ${index + 1}`));
+
+  const first = mergeReviewed(fx, sessions[0].path);
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stdout, /^MERGED main /);
+
+  for (let index = 1; index < sessions.length; index += 1) {
+    const prepared = mergeReviewed(fx, sessions[index].path);
+    assert.equal(prepared.code, 0, prepared.stderr);
+    assert.match(prepared.stdout, /^REVIEW_REQUIRED main [0-9a-f]{40,64} conflicts=1\s*$/);
+
+    const combined = Array.from({ length: index + 1 }, (_, item) => `session-${item + 1}`).join('\n');
+    writeFileSync(join(sessions[index].path, 'shared-file.txt'), `${combined}\n`);
+    fx.git(['add', '--', 'shared-file.txt'], sessions[index].path);
+    const committed = reviewedCommitAll(fx, sessions[index].path, `resolve session ${index + 1} integration`);
+    assert.equal(committed.code, 0, committed.stderr);
+
+    const retried = mergeReviewed(fx, sessions[index].path);
+    assert.equal(retried.code, 0, retried.stderr);
+    assert.match(retried.stdout, /^MERGED main [0-9a-f]{40,64} fast-forward\s*$/);
+  }
+
+  assert.equal(readFileSync(join(fx.shared, 'shared-file.txt'), 'utf8'), 'session-1\nsession-2\nsession-3\n');
+  for (const commit of commits) fx.git(['merge-base', '--is-ancestor', commit, 'main']);
 });
 
 // ---------------------------------------------------------------------------
 // 6. merge対象と衝突する未追跡ファイルが保持される
 // ---------------------------------------------------------------------------
 
-test('mergeが上書きする未追跡ファイルがあると、mergeせず内容を保持する', (t) => {
+test('merge先と同じ未追跡ファイルを未コミット内容として保持したまま統合する', (t) => {
   const fx = fixture(t);
   const wt = addWorktree(fx, 'session-untracked-clash');
 
-  commitIn(fx, wt.path, 'feature.txt', 'from worktree\n', 'add feature');
+  const reviewed = commitIn(fx, wt.path, 'feature.txt', 'from worktree\n', 'add feature');
   writeFileSync(join(fx.shared, 'feature.txt'), 'untracked local work\n');
 
-  const before = state(fx);
   const result = mergeReviewed(fx, wt.path);
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim(), `MERGED main ${reviewed} fast-forward preserved-untracked=1`);
   assert.equal(
     readFileSync(join(fx.shared, 'feature.txt'), 'utf8'),
     'untracked local work\n',
     '未追跡ファイルの内容が保持されている',
   );
-  assert.deepEqual(state(fx), before, 'HEAD・statusとも実行前と一致');
+  assert.equal(fx.git(['show', 'HEAD:feature.txt']), 'from worktree\n', 'mergeコミットにはレビュー済み内容が入る');
+  assert.match(state(fx).status, /^ M feature\.txt/m, 'ローカル内容は未コミット変更として残る');
   assert.ok(!existsSync(join(fx.shared, '.git', 'MERGE_HEAD')), 'merge途中の状態が残っていない');
 });
 
@@ -353,6 +256,26 @@ test('mergeが成功しても、無関係な未追跡ファイルは消さない
   assert.equal(result.code, 0, result.stderr);
   assert.equal(shaOf(fx, 'refs/heads/main'), head);
   assert.equal(readFileSync(join(fx.shared, 'scratch.txt'), 'utf8'), 'local scratch\n', '未追跡ファイルが残っている');
+});
+
+test('分岐後も同一パスの未追跡内容を保持してmerge commitを作る', (t) => {
+  const fx = fixture(t);
+  const wt = addWorktree(fx, 'session-untracked-diverged');
+  const theirs = commitIn(fx, wt.path, 'feature.txt', 'from worktree\n', 'add feature');
+  const ours = commitIn(fx, fx.shared, 'other.txt', 'other\n', 'add other');
+  writeFileSync(join(fx.shared, 'feature.txt'), 'local draft\n');
+
+  const result = mergeReviewed(fx, wt.path);
+  assert.equal(result.code, 0, result.stderr);
+  const [, branch, merged, kind, preserved] = result.stdout.trim().split(' ');
+  assert.equal(branch, 'main');
+  assert.equal(kind, 'merge-commit');
+  assert.equal(preserved, 'preserved-untracked=1');
+  assert.ok(isAncestor(fx, theirs, merged));
+  assert.ok(isAncestor(fx, ours, merged));
+  assert.equal(fx.git(['show', `${merged}:feature.txt`]), 'from worktree\n');
+  assert.equal(readFileSync(join(fx.shared, 'feature.txt'), 'utf8'), 'local draft\n');
+  assert.match(state(fx).status, /^ M feature\.txt/m);
 });
 
 // ---------------------------------------------------------------------------
@@ -658,12 +581,14 @@ test('成功時にも失敗時にもmergeロックを解放する', (t) => {
   assert.equal(ok.code, 0, ok.stderr);
   assert.ok(!existsSync(fx.lockPath), '成功後にロックが残っていない');
 
-  // 衝突させて失敗経路を通す。
+  // 衝突させて再レビュー準備経路を通す。
   commitIn(fx, wt.path, 'shared-file.txt', 'from worktree\n', 'edit in worktree');
   commitIn(fx, fx.shared, 'shared-file.txt', 'from shared\n', 'edit in shared');
-  const ng = mergeReviewed(fx, wt.path);
-  assert.equal(ng.code, 1);
-  assert.ok(!existsSync(fx.lockPath), '失敗後にもロックが残っていない');
+  const retry = mergeReviewed(fx, wt.path);
+  assert.equal(retry.code, 0, retry.stderr);
+  assert.match(retry.stdout, /^REVIEW_REQUIRED /);
+  assert.ok(!existsSync(fx.lockPath), '再レビュー準備後にもロックが残っていない');
+  fx.git(['merge', '--abort'], wt.path);
 });
 
 // ---------------------------------------------------------------------------
@@ -827,4 +752,186 @@ test('mergeロックを保持している間は、他プロセスがgit操作を
   assert.equal(result.code, 0, result.stderr);
   assert.equal(shaOf(fx, 'refs/heads/main'), head, 'ロック解放後にmergeできている');
   assert.ok(!existsSync(fx.lockPath), '自分のロックは解放している');
+});
+
+// ---------------------------------------------------------------------------
+// 共有側の未追跡ファイルと、専用worktreeで生成したファイル
+// ---------------------------------------------------------------------------
+
+test('共有側が未追跡ファイルだけなら確認を求めずworktree移動を指示する', (t) => {
+  const fx = fixture(t);
+  writeFileSync(join(fx.shared, 'local-only.txt'), 'keep local\n');
+
+  const result = markPrompt(fx, 'session-untracked-advisory');
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  const context = output.hookSpecificOutput.additionalContext;
+  assert.match(context, /EnterWorktree\(name:/);
+  assert.doesNotMatch(context, /未コミット変更をコミット/);
+  assert.equal(recordedTarget(fx, worktreeName('session-untracked-advisory')), 'main');
+  assert.equal(readFileSync(join(fx.shared, 'local-only.txt'), 'utf8'), 'keep local\n');
+});
+
+test('共有側のBash実行は専用worktreeへ移るまで拒否する', (t) => {
+  const fx = fixture(t);
+  writeFileSync(join(fx.shared, 'local-only.txt'), 'keep local\n');
+
+  const result = tryRun(['node', WORKTREE_GUARD], {
+    cwd: fx.shared,
+    env: fx.env,
+    input: JSON.stringify({
+      cwd: fx.shared,
+      session_id: 'session-bash-guard',
+      tool_name: 'Bash',
+      tool_input: { command: 'git status --short' },
+    }),
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /EnterWorktree\(name:/);
+  assert.doesNotMatch(output.hookSpecificOutput.permissionDecisionReason, /未コミット変更をコミット/);
+  assert.equal(readFileSync(join(fx.shared, 'local-only.txt'), 'utf8'), 'keep local\n');
+});
+
+test('session_idが無い共有側のBashもfail-openせず拒否する', (t) => {
+  const fx = fixture(t);
+  const result = tryRun(['node', WORKTREE_GUARD], {
+    cwd: fx.shared,
+    env: fx.env,
+    input: JSON.stringify({
+      cwd: fx.shared,
+      tool_name: 'Bash',
+      tool_input: { command: 'git status --short' },
+    }),
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /session_id/);
+});
+
+/**
+ * Bashは対象を見ずに拒否するので、パスを比較する経路（Edit / Write /
+ * NotebookEdit）はここでしか通らない。`%TEMP%` が 8.3 短縮名を返す環境では、
+ * gitの返す長いパスと綴りが食い違い、比較が「共有ツリーの外」と答えて
+ * **ガードが黙って書き込みを許す**。実際にそうなっていた。
+ */
+test('共有ツリーへのWriteも拒否する（パスの綴りが違ってもfail-openしない）', (t) => {
+  const fx = fixture(t);
+
+  const result = tryRun(['node', WORKTREE_GUARD], {
+    cwd: fx.shared,
+    env: fx.env,
+    input: JSON.stringify({
+      cwd: fx.shared,
+      session_id: 'session-write-guard',
+      tool_name: 'Write',
+      tool_input: { file_path: join(fx.shared, 'new-file.txt') },
+    }),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(output.hookSpecificOutput.permissionDecisionReason, /EnterWorktree\(name:/);
+});
+
+test('未コミット変更があるWriteのdeny理由に、コミットして分離する手段が入る', (t) => {
+  const fx = fixture(t);
+  writeFileSync(join(fx.shared, 'sentinel.txt'), 'uncommitted\n');
+
+  const result = tryRun(['node', WORKTREE_GUARD], {
+    cwd: fx.shared,
+    env: fx.env,
+    input: JSON.stringify({
+      cwd: fx.shared,
+      session_id: 'session-dirty-guard',
+      tool_name: 'Write',
+      tool_input: { file_path: join(fx.shared, 'new-file.txt') },
+    }),
+  });
+
+  const reason = JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason;
+  assert.match(reason, /未コミットの変更が残っているため/);
+  assert.match(reason, /commit-shared-wip\.js" --confirm/);
+  assert.match(reason, /stash \/ reset \/ checkout/);
+  assert.equal(
+    readFileSync(join(fx.shared, 'sentinel.txt'), 'utf8'),
+    'uncommitted\n',
+    'hookは何も変更しない',
+  );
+});
+
+test('UserPromptSubmitの案内にも、コミットして分離する選択肢が入る', (t) => {
+  const fx = fixture(t);
+  writeFileSync(join(fx.shared, 'sentinel.txt'), 'uncommitted\n');
+
+  const result = markPrompt(fx, 'session-dirty-advisory');
+
+  const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+  assert.match(context, /現在のブランチへコミットしてから分離する/);
+  assert.match(context, /commit-shared-wip\.js" --confirm/);
+  assert.doesNotMatch(context, /EnterWorktree\(name:/, '分離できない間は移動を指示しない');
+});
+
+test('commit-reviewed --allは専用worktreeで生成した未追跡ファイルもコミットする', (t) => {
+  const fx = fixture(t);
+  const wt = addWorktree(fx, 'session-commit-all');
+  writeFileSync(join(wt.path, 'generated.txt'), 'generated in session\n');
+  writeFileSync(join(wt.path, 'shared-file.txt'), 'edited in session\n');
+  const fingerprint = run(['node', STOP_HOOK, '--print'], { cwd: wt.path, env: fx.env }).trim();
+
+  const result = tryRun([
+    'node', COMMIT_REVIEWED,
+    '--expected', fingerprint,
+    '--message', 'include complete session',
+    '--all',
+  ], { cwd: wt.path, env: fx.env });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /COMMITTED [0-9a-f]{40,64}/);
+  assert.equal(fx.git(['status', '--porcelain'], wt.path), '', '専用worktreeに未コミット差分が残らない');
+  assert.equal(fx.git(['show', 'HEAD:generated.txt'], wt.path), 'generated in session\n');
+  assert.equal(fx.git(['show', 'HEAD:shared-file.txt'], wt.path), 'edited in session\n');
+});
+
+test('commit-reviewed --allはrename元の削除も含める', (t) => {
+  const fx = fixture(t);
+  const wt = addWorktree(fx, 'session-commit-rename');
+  fx.git(['mv', 'shared-file.txt', 'renamed-file.txt'], wt.path);
+  const fingerprint = run(['node', STOP_HOOK, '--print'], { cwd: wt.path, env: fx.env }).trim();
+  const result = tryRun([
+    'node', COMMIT_REVIEWED,
+    '--expected', fingerprint,
+    '--message', 'include rename',
+    '--all',
+  ], { cwd: wt.path, env: fx.env });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fx.git(['status', '--porcelain'], wt.path), '');
+  assert.ok(!existsSync(join(wt.path, 'shared-file.txt')));
+  assert.equal(fx.git(['show', 'HEAD:renamed-file.txt'], wt.path), 'base\n');
+});
+
+test('run-reviewはリポジトリ内へレビュー出力を作らない', (t) => {
+  const fx = fixture(t);
+  const output = join(fx.shared, 'codex-review-output.txt');
+  assert.match(checkOutFile(output, fx.shared, fx.env), /レビュー出力はリポジトリ外/);
+  assert.ok(!existsSync(output), 'リポジトリ内に出力ファイルを作っていない');
+});
+
+test('setupとdoctorはBashを含む同じPreToolUse matcherを正常と判定する', (t) => {
+  const fx = fixture(t);
+  const setup = tryRun(['node', SETUP_AUTO, '--enable-schedule'], { cwd: fx.shared, env: fx.env });
+  assert.equal(setup.code, 0, setup.stderr);
+
+  const settings = JSON.parse(readFileSync(join(fx.shared, '.claude', 'settings.local.json'), 'utf8'));
+  const guard = settings.hooks.PreToolUse.find((group) =>
+    group.hooks.some((hook) => hook.command.includes('worktree-guard.js')));
+  assert.equal(guard.matcher, 'Edit|Write|NotebookEdit|Bash');
+
+  const doctor = tryRun(['node', DOCTOR], { cwd: fx.shared, env: fx.env });
+  assert.match(doctor.stdout, /\[OK\] hooks: UserPromptSubmit \/ PreToolUse \/ Stop を確認/);
+  assert.doesNotMatch(doctor.stdout, /競合または旧登録/);
 });

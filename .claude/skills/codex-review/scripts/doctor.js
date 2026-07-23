@@ -167,7 +167,7 @@ function checkHooks() {
   // covers, or it would either miss writes or fire on every tool call.
   const required = {
     UserPromptSubmit: { script: 'mark-prompt.js', matcher: null },
-    PreToolUse: { script: 'worktree-guard.js', matcher: 'Edit|Write|NotebookEdit' },
+    PreToolUse: { script: 'worktree-guard.js', matcher: 'Edit|Write|NotebookEdit|Bash' },
     Stop: { script: 'stop-hook.js', matcher: null },
   };
   let expectedCommands;

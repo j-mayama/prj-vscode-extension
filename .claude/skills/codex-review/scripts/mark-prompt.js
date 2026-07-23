@@ -30,7 +30,7 @@ const {
   unlinkSync,
   writeFileSync,
 } = require('node:fs');
-const { join } = require('node:path');
+const { join, resolve } = require('node:path');
 
 const { renameAtomic } = require('./file-core.js');
 const {
@@ -43,8 +43,8 @@ const {
 } = require('./state-core.js');
 const {
   OPT_OUT_FILE,
+  currentBranch,
   dirtyEntries,
-  git,
   isEnabled,
   isLinkedWorktree,
   isOptedOut,
@@ -56,6 +56,11 @@ const {
   worktreePath,
   writeMergeTarget,
 } = require('./worktree-core.js');
+
+// Offered to the user as the one non-destructive way out of a dirty shared
+// checkout. Never run from here: it requires --confirm, and the decision to
+// commit on someone's branch is theirs.
+const WIP_SCRIPT = resolve(__dirname, 'commit-shared-wip.js');
 
 function stateKey(value) {
   return createHash('sha256').update(value).digest('hex').slice(0, 16);
@@ -89,10 +94,11 @@ function mergeTarget(shared, sessionId, existing) {
   const name = worktreeName(sessionId);
   if (existing) return recordedTarget(shared, name);
 
-  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], shared).trim();
   // Detached: there is no branch for reviewed work to return to. Recording the
-  // bare sha would name a target no merge can update.
-  if (branch === 'HEAD') return null;
+  // bare sha would name a target no merge can update. currentBranch() also keeps
+  // a same-named tag from turning the record into `heads/<name>`.
+  const branch = currentBranch(shared);
+  if (!branch) return null;
   writeMergeTarget(shared, name, branch);
   return branch;
 }
@@ -114,14 +120,22 @@ function worktreeContext(startDir, sessionId) {
   if (isLinkedWorktree(startDir)) return null;
   if (!sessionId) return null;
 
-  const dirty = dirtyEntries(shared);
+  // Untracked files can safely stay in the shared checkout. A session worktree
+  // starts from HEAD, so it will neither see nor commit them; merge-reviewed.js
+  // preserves them and handles a same-path collision without overwriting their
+  // contents. Tracked edits still have to stop isolation because leaving those
+  // behind would silently change the task's starting point.
+  const dirty = dirtyEntries(shared, { untracked: false });
   if (dirty.length) {
     return [
       '[codex-review] このリポジトリはセッションごとのworktree分離が有効ですが、',
       '共有作業ツリーに未コミット変更があるため自動で分離できません。',
       'ファイルを変更する前に、次をユーザーへ確認してください:',
-      '  1. 未コミット変更をコミットしてから実装を指示し直す',
-      `  2. このリポジトリでは分離しない（${toPosix(join(shared, OPT_OUT_FILE))} を作成する）`,
+      '  1. その未コミット変更を現在のブランチへコミットしてから分離する',
+      `     → 対象の確認: node "${toPosix(WIP_SCRIPT)}" --plan`,
+      `     → 同意を得てから: node "${toPosix(WIP_SCRIPT)}" --confirm <fingerprint>`,
+      '  2. ユーザー自身がコミットしてから、あらためて実装を指示し直す',
+      `  3. このリポジトリでは分離しない（${toPosix(join(shared, OPT_OUT_FILE))} を作成する）`,
       'stash / reset / checkout / コピーによる移送は行わないでください。',
       '調査・質問だけならこのまま進めて構いません。',
     ].join('\n');
@@ -155,11 +169,11 @@ function worktreeContext(startDir, sessionId) {
     '[codex-review] このリポジトリは、実装を伴うセッションを専用ブランチ＋worktreeへ分離します。',
     '同じプロジェクトで並行する別セッションとファイルを奪い合わないための構成です。',
     '',
-    '**このセッションで最初にファイルを変更する前に**、次を実行して移動してください:',
+    '**このセッションで最初にBashを使うか、ファイルを変更する前に**、次を実行して移動してください:',
     move,
     '',
-    '- 調査・質問だけで終わる場合はworktreeを作らなくて構いません',
-    '- 移動せずに共有作業ツリーへ書き込もうとすると、PreToolUseフックが拒否します',
+    '- ツールを使わない調査・質問だけならworktreeを作らなくて構いません',
+    '- 移動せずに共有作業ツリーでBashや書き込みを行うと、PreToolUseフックが拒否します',
     '- 移動後はレビュー・自動コミットもそのworktree内で通常どおり動作します',
     target
       ? `- レビューと自動コミットのあと、${target}（このworktreeの統合先として記録済み）へmergeします`

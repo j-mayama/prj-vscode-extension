@@ -81,6 +81,17 @@ const {
   withStateLock,
   writeState,
 } = require('./state-core.js');
+const {
+  branchExists,
+  commitOf,
+  currentBranch,
+  isAncestor,
+  isBranchName,
+  isLinkedWorktree,
+  mainRoot,
+  readMergeTargets,
+  worktreeNameFromPath,
+} = require('./worktree-core.js');
 
 const FLAG_FILE = '.codex-review-auto';
 const SETUP_LOCK_FILE = '.codex-review-setup.lock';
@@ -983,6 +994,226 @@ function blockReason(root, mode, sessionId) {
   ].join('\n');
 }
 
+/** Reminders for one source commit before this hook stops repeating itself. */
+const MERGE_NOTICE_LIMIT = 5;
+
+const MERGE_SCRIPT = resolve(__dirname, 'merge-reviewed.js').replace(/\\/g, '/');
+
+/**
+ * Whether this session's commits reached the branch they came from.
+ *
+ * Committing inside a linked worktree is only half of "done": the shared
+ * checkout keeps its own HEAD, so nothing outside the worktree — a local site,
+ * the branch the user is looking at, the next session — sees the work. The diff
+ * fingerprint cannot notice this, because a successful commit is exactly what
+ * makes the tree clean. Without this check the one step that delivers the work
+ * is the one step nothing verifies, and a skipped merge looks identical to a
+ * finished job.
+ *
+ * Returns one of three states, never a silent "probably fine":
+ *
+ * - `merged` … nothing to do (also covers "not isolated" and "no target yet")
+ * - `unmerged` … commits exist that the target branch does not contain
+ * - `unverifiable` … the target cannot be determined *and that is itself a
+ *   problem*. Staying quiet here would hide a worktree whose work can never be
+ *   integrated, which looks exactly like a worktree that was integrated.
+ */
+function mergeStatus(root) {
+  const quiet = { state: 'merged' };
+  if (!isLinkedWorktree(root)) return quiet;
+
+  const shared = mainRoot(root);
+  const worktreeRoot = git(['rev-parse', '--show-toplevel'], root).trim();
+  const name = worktreeNameFromPath(shared, worktreeRoot);
+  // Not one of this skill's worktrees: the user made it, and where it belongs
+  // is not this hook's to guess.
+  if (!name) return quiet;
+
+  const head = (() => {
+    try {
+      return git(['rev-parse', '--verify', 'HEAD^{commit}'], root).trim();
+    } catch {
+      return null;
+    }
+  })();
+
+  const source = currentBranch(root);
+  if (!source) {
+    return {
+      state: 'unverifiable',
+      head,
+      problem: 'このworktreeがdetached HEADのため、統合すべきブランチを特定できません',
+      hint: 'このworktreeのブランチをcheckoutし直してから、mergeを実行してください',
+    };
+  }
+
+  const targets = readMergeTargets(shared, name);
+  const key = `codexreview.${name}.mergeInto`;
+  const repair = `共有チェックアウトで復旧: git config --local --replace-all ${key} <ブランチ名>`;
+
+  if (targets.length === 0) {
+    return {
+      state: 'unverifiable',
+      head,
+      problem: `このworktree（${name}）の統合先が記録されていません`,
+      hint: `記録前に作られたworktreeか、記録に失敗しています。${repair}`,
+    };
+  }
+  if (targets.length > 1) {
+    return {
+      state: 'unverifiable',
+      head,
+      problem: `このworktree（${name}）の統合先が複数記録されています: ${targets.join(', ')}`,
+      hint: repair,
+    };
+  }
+  const target = targets[0];
+  if (!isBranchName(root, target)) {
+    return {
+      state: 'unverifiable',
+      head,
+      problem: `記録された統合先がブランチ名として不正です: ${JSON.stringify(target)}`,
+      hint: repair,
+    };
+  }
+  if (target === source) return quiet;
+  if (!branchExists(root, target)) {
+    return {
+      state: 'unverifiable',
+      head,
+      problem: `記録された統合先ブランチ ${target} が存在しません（削除・改名された可能性があります）`,
+      hint: `${target} を作り直すか、${repair}`,
+    };
+  }
+
+  // Refs are shared by every worktree of the repository, so both ends resolve
+  // from here.
+  const sourceHead = commitOf(root, source);
+  if (isAncestor(root, sourceHead, commitOf(root, target))) return quiet;
+
+  return { state: 'unmerged', head: sourceHead, source, target };
+}
+
+function unmergedReason(info, attempted) {
+  return [
+    'このセッションのworktreeには、まだ元のブランチへmergeしていないコミットがあります。',
+    '',
+    `  worktree : ${info.source}（${info.head.slice(0, 12)}）`,
+    `  統合先   : ${info.target}`,
+    '',
+    'worktree内のコミットは、そのworktreeの外からは見えません。共有チェックアウトから',
+    '配信しているサイトにも、そのブランチを見ている利用者にも、まだ何も届いていません。',
+    'コミットは半分で、mergeが残り半分です。',
+    '',
+    '現在のworktreeで次を実行してください（引数はありません。pushはしません）:',
+    `  node "${MERGE_SCRIPT}"`,
+    '',
+    '結果の扱いはcodex-reviewスキルの「🔀 mergeの出し方」に従うこと:',
+    '  MERGED / UP_TO_DATE … 完了報告の「統合」行へ結果を残す',
+    '  REVIEW_REQUIRED …… 競合を解消し、再レビュー・再コミットしてからmergeを再実行する',
+    '  失敗 ……………………… 理由と利用者がやるべきことを「🔧 要対応」に出す',
+    '',
+    attempted
+      ? '前回の実行結果が記録されていますが、統合先にはまだ入っていません。'
+        + '同じ結果になるなら、その理由を完了報告へ残してください。'
+      : 'まだ一度も実行されていません。**実行せずにこの通知だけを無視しても、'
+        + '次のStopで同じ通知が出ます。**',
+  ].join('\n');
+}
+
+function unverifiableReason(info) {
+  return [
+    'このセッションのworktreeは、レビュー済みの成果をどこへ統合すべきか確認できません。',
+    '',
+    `  問題 : ${info.problem}`,
+    `  対処 : ${info.hint}`,
+    '',
+    'この状態を放置すると、worktree内のコミットはどのブランチにも入らず、',
+    '共有チェックアウトからは見えないまま残ります。',
+    '',
+    '対処したうえで、現在のworktreeで次を実行してください:',
+    `  node "${MERGE_SCRIPT}"`,
+    '',
+    '自分で対処できない場合は、mergeできないことと上の問題を完了報告の',
+    '「🔧 要対応」へ出してください。黙って終えないでください。',
+  ].join('\n');
+}
+
+/**
+ * Decides whether this stop still owes a merge, and remembers the decision.
+ *
+ * The bookkeeping is deliberately *not* "already told them once". A reminder
+ * that is ignored has changed nothing, so repeating it is the only way the
+ * check has teeth. What ends the reminders is evidence that merge-reviewed.js
+ * actually ran for this commit (`state.merge`, written by that script) — the
+ * difference between "nobody tried" and "tried, and it cannot be done" is
+ * exactly the difference between insisting and getting out of the way.
+ *
+ * `MERGE_NOTICE_LIMIT` is the backstop for the case where neither happens: the
+ * model never runs the command *and* the script never records anything. Without
+ * it the session would be blocked on every stop forever.
+ */
+function blockWhenUnmerged(root) {
+  let reason = null;
+  try {
+    const status = mergeStatus(root);
+    if (status.state === 'merged') return;
+
+    const decision = withStateLock(root, () => {
+      const state = readState(root, { strict: true });
+      const record = state.merge && state.merge.head === status.head ? state.merge : null;
+
+      // merge-reviewed.js ran for this exact commit and could not finish it.
+      // Saying so again every turn would trap the session in a situation only a
+      // human can resolve.
+      if (record && (record.result === 'failed' || record.result === 'review-required')) {
+        return { block: false };
+      }
+      const notified = record && typeof record.notified === 'number' ? record.notified : 0;
+      if (notified >= MERGE_NOTICE_LIMIT) return { block: false, exhausted: true };
+
+      writeState(root, {
+        ...state,
+        merge: { ...(record ?? {}), head: status.head, notified: notified + 1 },
+      });
+      return { block: true, attempted: Boolean(record && record.result) };
+    });
+
+    if (decision.exhausted) {
+      // Giving up is a decision the user has to be able to see.
+      process.stdout.write(
+        JSON.stringify({
+          systemMessage:
+            `codex-review: 未mergeのコミットを${MERGE_NOTICE_LIMIT}回通知しましたが解消されていません。`
+              + `統合するには worktree 内で: node "${MERGE_SCRIPT}"`,
+        }),
+      );
+      process.exit(0);
+    }
+    if (!decision.block) return;
+
+    reason = status.state === 'unmerged'
+      ? unmergedReason(status, decision.attempted)
+      : unverifiableReason(status);
+  } catch (error) {
+    // Never silently. Repeat-suppression lives in the state file, so if that
+    // cannot be read or written there is no way to block without risking a
+    // permanent loop — but a check that stopped checking must not look like a
+    // clean result either.
+    process.stdout.write(
+      JSON.stringify({
+        systemMessage:
+          `codex-review: 未mergeの確認ができませんでした（${error.message}）。`
+            + `mergeが必要かどうかは worktree 内で node "${MERGE_SCRIPT}" を実行して確認してください`,
+      }),
+    );
+    process.exit(0);
+  }
+
+  process.stdout.write(JSON.stringify({ decision: 'block', reason }));
+  process.exit(0);
+}
+
 const ARGS = process.argv.slice(2);
 const MARK_INDEX = ARGS.indexOf('--mark');
 const IS_MARK = MARK_INDEX !== -1;
@@ -1355,7 +1586,13 @@ function main() {
     return;
   }
 
-  if (current === null) allowStop();
+  // A clean tree is where the review loop ends and where the merge is still
+  // owed: commit-reviewed.js is what made it clean. Checked before allowing the
+  // stop, and only in hook mode — the CLI paths above are single-purpose.
+  if (current === null) {
+    if (!IS_CLI) blockWhenUnmerged(root);
+    allowStop();
+  }
   const claimed = withStateLock(root, () => {
     // setup-auto.js holds this project lock while enabling/disabling and clears
     // abandoned claims before releasing it. Recheck inside the state lock so a

@@ -586,7 +586,7 @@ function enableUnlocked(root) {
   const settings = readJson(settingsPath);
   installEvent(settings, 'UserPromptSubmit', 'mark-prompt.js');
   installEvent(settings, 'Stop', 'stop-hook.js');
-  installEvent(settings, 'PreToolUse', 'worktree-guard.js', 'Edit|Write|NotebookEdit');
+  installEvent(settings, 'PreToolUse', 'worktree-guard.js', 'Edit|Write|NotebookEdit|Bash');
   const baseRefIsHead = ensureBaseRef(settings);
   const settingsContent = `${JSON.stringify(settings, null, 2)}\n`;
   const ignoreContent = ignoredContent(ignorePath);
