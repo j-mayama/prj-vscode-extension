@@ -37,3 +37,7 @@ Thumbs.db
 .nyc_output/
 coverage/
 .vscode-test/
+# codex-review のローカル設定と ON/OFF スイッチ
+.claude/worktrees/
+.codex-review-no-worktree
+.codex-review-setup.lock

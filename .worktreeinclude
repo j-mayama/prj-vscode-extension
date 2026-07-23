@@ -1,0 +1,3 @@
+# codex-review: worktree でも自動レビューを動かすために複製する
+.codex-review-auto
+.claude/settings.local.json
